@@ -1,0 +1,257 @@
+"""Neo FoxZone 管理命令。"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Awaitable
+from typing import cast
+
+from src.app.plugin_system.api import service_api
+from src.app.plugin_system.base import BaseCommand, cmd_route
+from src.app.plugin_system.types import PermissionLevel
+
+from . import BACKEND_SERVICE_SIGNATURE, SERVICE_SIGNATURE
+from .config import NeoFoxzoneConfig
+from .service import NeoFoxzoneError, NeoFoxzoneService, QzoneResponse
+
+
+def _parse_string_list(value: str) -> list[str] | None:
+    """把逗号分隔字符串转换为非空字符串列表。"""
+    result = [item.strip() for item in value.split(",") if item.strip()]
+    return result or None
+
+
+def _parse_int_list(value: str) -> list[int] | None:
+    """把逗号分隔字符串转换为整数列表。"""
+    if not value.strip():
+        return None
+    try:
+        return [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise NeoFoxzoneError("QQ 号列表必须由逗号分隔的整数构成。") from error
+
+
+class NeoFoxzoneCommand(BaseCommand):
+    """提供全部 QQ 空间说说能力的运营者命令。"""
+
+    command_name = "neofoxzone"
+    command_description = "Neo FoxZone QQ 空间说说管理命令"
+    name = "neofoxzone"
+    description = "查询、发布、删除、互动和管理 QQ 空间说说"
+    permission_level = PermissionLevel.OPERATOR
+    command_prefix = "/"
+    dependencies = [SERVICE_SIGNATURE]
+
+    def _service(self) -> NeoFoxzoneService:
+        """获取 Neo FoxZone Service。"""
+        service = service_api.get_service(SERVICE_SIGNATURE)
+        if service is None:
+            raise NeoFoxzoneError("Neo FoxZone Service 未注册。")
+        return cast(NeoFoxzoneService, service)
+
+    def _output_limit(self, service: NeoFoxzoneService) -> int:
+        """获取命令输出字符限制。"""
+        config = service.plugin.config
+        if isinstance(config, NeoFoxzoneConfig):
+            return max(500, int(config.limits.max_command_output_chars))
+        return 12000
+
+    def _format_response(
+        self,
+        service: NeoFoxzoneService,
+        response: QzoneResponse,
+    ) -> str:
+        """格式化并截断 OneBot 原始响应。"""
+        rendered = json.dumps(
+            response,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        limit = self._output_limit(service)
+        if len(rendered) > limit:
+            return f"{rendered[:limit]}\n...（输出已截断，共 {len(rendered)} 字符）"
+        return rendered
+
+    async def _run(
+        self,
+        operation: Awaitable[QzoneResponse],
+        success_message: str,
+    ) -> tuple[bool, str]:
+        """执行命令调用并展示完整协议响应。"""
+        try:
+            service = self._service()
+            response = await operation
+        except NeoFoxzoneError as error:
+            return False, str(error)
+        except Exception as error:
+            return False, f"QQ 空间调用异常: {error}"
+
+        rendered = self._format_response(service, response)
+        if service.response_succeeded(response):
+            return True, f"{success_message}\n{rendered}"
+        return False, f"{service.response_error(response)}\n{rendered}"
+
+    @cmd_route()
+    async def handle_help(self) -> tuple[bool, str]:
+        """显示完整命令帮助。"""
+        return True, (
+            "Neo FoxZone 命令：\n"
+            "/neofoxzone status\n"
+            "/neofoxzone posts [pos] [num]\n"
+            "/neofoxzone feeds [page_num] [count]\n"
+            "/neofoxzone publish \"正文\" [图片逗号列表] [权限] [QQ逗号列表]\n"
+            "/neofoxzone delete <tid>\n"
+            "/neofoxzone like <tid> [发布者QQ]\n"
+            "/neofoxzone unlike <tid> [发布者QQ]\n"
+            "/neofoxzone comment <tid> \"正文\" [发布者QQ] [图片逗号列表]\n"
+            "/neofoxzone ban <QQ号> [true|false]\n"
+            "/neofoxzone visibility <tid> <权限> [QQ逗号列表]\n"
+            "权限：1=所有人，4=好友，16=部分好友，64=仅自己，128=部分好友不可见。"
+        )
+
+    @cmd_route("status")
+    async def handle_status(self) -> tuple[bool, str]:
+        """检查 Neo FoxZone 与前置 Service 是否已注册。"""
+        own_service = service_api.get_service(SERVICE_SIGNATURE)
+        backend_service = service_api.get_service(BACKEND_SERVICE_SIGNATURE)
+        ready = own_service is not None and backend_service is not None
+        return ready, (
+            f"Neo FoxZone Service: {'已就绪' if own_service else '未注册'}\n"
+            f"OneBot Expand QZone Service: {'已就绪' if backend_service else '未注册'}"
+        )
+
+    @cmd_route("posts")
+    async def handle_posts(
+        self,
+        pos: int = 0,
+        num: int = 10,
+    ) -> tuple[bool, str]:
+        """获取当前 QQ 的说说列表。"""
+        service = self._service()
+        return await self._run(
+            service.get_qzone_msg_list(pos=pos, num=num),
+            "说说列表获取成功。",
+        )
+
+    @cmd_route("feeds")
+    async def handle_feeds(
+        self,
+        page_num: int = 0,
+        count: int = 10,
+    ) -> tuple[bool, str]:
+        """获取好友空间动态。"""
+        service = self._service()
+        return await self._run(
+            service.get_qzone_feeds(page_num=page_num, count=count),
+            "好友动态获取成功。",
+        )
+
+    @cmd_route("publish")
+    async def handle_publish(
+        self,
+        content: str,
+        images: str = "",
+        ugc_right: int = 1,
+        target_uins: str = "",
+    ) -> tuple[bool, str]:
+        """发表说说，带空格的正文和 URL 列表请使用引号包裹。"""
+        service = self._service()
+        return await self._run(
+            service.send_qzone_msg(
+                content=content,
+                images=_parse_string_list(images),
+                ugc_right=ugc_right,
+                target_uins=_parse_int_list(target_uins),
+            ),
+            "说说发表成功。",
+        )
+
+    @cmd_route("delete")
+    async def handle_delete(self, tid: str) -> tuple[bool, str]:
+        """删除指定说说。"""
+        service = self._service()
+        return await self._run(
+            service.delete_qzone_msg(tid=tid),
+            "说说删除成功。",
+        )
+
+    @cmd_route("like")
+    async def handle_like(
+        self,
+        tid: str,
+        target_uin: int = 0,
+    ) -> tuple[bool, str]:
+        """点赞指定说说。"""
+        service = self._service()
+        return await self._run(
+            service.like_qzone(tid=tid, target_uin=target_uin or None),
+            "点赞成功。",
+        )
+
+    @cmd_route("unlike")
+    async def handle_unlike(
+        self,
+        tid: str,
+        target_uin: int = 0,
+    ) -> tuple[bool, str]:
+        """取消点赞指定说说。"""
+        service = self._service()
+        return await self._run(
+            service.unlike_qzone(tid=tid, target_uin=target_uin or None),
+            "已取消点赞。",
+        )
+
+    @cmd_route("comment")
+    async def handle_comment(
+        self,
+        tid: str,
+        content: str,
+        target_uin: int = 0,
+        images: str = "",
+    ) -> tuple[bool, str]:
+        """评论指定说说。"""
+        service = self._service()
+        return await self._run(
+            service.comment_qzone(
+                tid=tid,
+                content=content,
+                target_uin=target_uin or None,
+                images=_parse_string_list(images),
+            ),
+            "评论发送成功。",
+        )
+
+    @cmd_route("ban")
+    async def handle_ban(
+        self,
+        user_id: int,
+        enable: bool = True,
+    ) -> tuple[bool, str]:
+        """拉黑或解除拉黑空间用户。"""
+        service = self._service()
+        return await self._run(
+            service.set_qzone_ban(user_id=user_id, enable=enable),
+            "空间黑名单设置成功。",
+        )
+
+    @cmd_route("visibility")
+    async def handle_visibility(
+        self,
+        tid: str,
+        ugc_right: int,
+        target_uins: str = "",
+    ) -> tuple[bool, str]:
+        """修改已发布说说的查看权限。"""
+        service = self._service()
+        return await self._run(
+            service.set_qzone_msg_right(
+                tid=tid,
+                ugc_right=ugc_right,
+                target_uins=_parse_int_list(target_uins),
+            ),
+            "说说查看权限修改成功。",
+        )
+
+
+__all__ = ["NeoFoxzoneCommand"]
