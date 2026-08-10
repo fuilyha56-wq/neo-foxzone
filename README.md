@@ -79,6 +79,16 @@ Neo FoxZone Image Provider
 - 协议端失败会保留完整 OneBot 响应，便于定位 `retcode`、`msg` 和 `wording`。
 - 其他插件可以复用统一的 Neo FoxZone Service，无需重复实现输入校验。
 
+## 是否需要配置 HTTP 服务
+
+不需要。Neo FoxZone 不监听端口，也不注册 FastAPI 路由或对外回调地址；查询、发布、
+评论和轮询全部通过进程内的 OneBot Expand Service 调用已有 OneBot Adapter 连接。
+
+需要正常配置的是 Neo-MoFox 原有的 OneBot Adapter 与协议端连接。图片参数若使用
+`http://` 或 `https://`，该地址只需能被协议端访问，不代表 Neo FoxZone 自身需要
+额外启动 HTTP 服务。可选图片 Provider 若有自己的 WebUI 或 HTTP 后端，也由该
+Provider 单独配置。
+
 ## 前置要求
 
 - Neo-MoFox `>= 1.0.0`
@@ -740,4 +750,4 @@ mpdt plugin build plugins/neo-foxzone
 
 ## 许可证
 
-本插件采用 AGPL-3.0 许可证。
+本插件采用 [GNU Affero General Public License v3.0](LICENSE) 许可证。

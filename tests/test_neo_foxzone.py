@@ -326,6 +326,20 @@ def test_manifest_declares_market_and_runtime_dependency() -> None:
     assert len(manifest["include"]) == 13
 
 
+def test_repository_contains_agpl_v3_license() -> None:
+    """仓库根目录应包含与 manifest 一致的标准 AGPL v3 许可证。"""
+    plugin_root = Path(__file__).parents[1]
+    manifest = json.loads(
+        (plugin_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    license_text = (plugin_root / "LICENSE").read_text(encoding="utf-8")
+
+    assert manifest["license"] == "AGPL-3.0"
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in license_text
+    assert "Version 3, 19 November 2007" in license_text
+    assert "END OF TERMS AND CONDITIONS" in license_text
+
+
 def test_image_result_normalizes_common_service_shapes() -> None:
     """通用图片 Provider 应统一 URL、data URI、裸 Base64 和结构化返回。"""
     payload = "a" * 64
