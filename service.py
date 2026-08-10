@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from src.app.plugin_system.api import service_api
 from src.app.plugin_system.base import BaseService
@@ -10,6 +10,7 @@ from src.app.plugin_system.base import BaseService
 from . import BACKEND_SERVICE_SIGNATURE, SERVICE_NAME
 from .config import NeoFoxzoneConfig
 from .contracts import OneBotQzoneService
+from .image_provider import ImageProviderError, generate_images
 
 QzoneResponse = dict[str, Any]
 VALID_UGC_RIGHTS = frozenset({1, 4, 16, 64, 128})
@@ -26,7 +27,7 @@ class NeoFoxzoneService(BaseService):
     service_description = "基于 OneBot Expand 的 QQ 空间说说全功能服务"
     name = SERVICE_NAME
     description = "基于 OneBot Expand 的 QQ 空间说说全功能服务"
-    version = "1.0.0"
+    version = "0.1.0"
     dependencies = [BACKEND_SERVICE_SIGNATURE]
 
     def _config(self) -> NeoFoxzoneConfig:
@@ -49,10 +50,16 @@ class NeoFoxzoneService(BaseService):
             )
         return cast(OneBotQzoneService, backend)
 
-    def _validate_query(self, offset: int, count: int) -> None:
+    def _validate_query(
+        self,
+        offset: int,
+        count: int,
+        *,
+        minimum: int = 0,
+    ) -> None:
         """校验分页参数。"""
-        if offset < 0:
-            raise NeoFoxzoneError("分页位置或页码不能小于 0。")
+        if offset < minimum:
+            raise NeoFoxzoneError(f"分页位置或页码不能小于 {minimum}。")
         maximum = max(1, int(self._config().limits.max_query_count))
         if count < 1 or count > maximum:
             raise NeoFoxzoneError(f"查询数量必须在 1 到 {maximum} 之间。")
@@ -141,11 +148,11 @@ class NeoFoxzoneService(BaseService):
 
     async def get_qzone_feeds(
         self,
-        page_num: int = 0,
+        page_num: int = 1,
         count: int = 10,
     ) -> QzoneResponse:
         """获取当前登录 QQ 的好友动态。"""
-        self._validate_query(page_num, count)
+        self._validate_query(page_num, count, minimum=1)
         return await self._backend().get_qzone_feeds(
             page_num=page_num,
             count=count,
@@ -158,19 +165,51 @@ class NeoFoxzoneService(BaseService):
         ugc_right: int = 1,
         target_uins: list[int] | None = None,
     ) -> QzoneResponse:
-        """发表文字或图片说说，并可在发布时设置查看权限。"""
+        """发表说说，可附带图片并在发布时设置查看权限。"""
         normalized_images = self._normalize_images(images)
-        if not str(content).strip() and not normalized_images:
-            raise NeoFoxzoneError("说说正文与图片不能同时为空。")
+        normalized_content = str(content).strip()
+        if not normalized_content:
+            if not normalized_images:
+                raise NeoFoxzoneError("说说正文与图片不能同时为空。")
+            raise NeoFoxzoneError("当前 OneBot 后端要求说说正文不能为空。")
         normalized_right, normalized_targets = self._validate_right(
             ugc_right,
             target_uins,
         )
         return await self._backend().send_qzone_msg(
-            content=content,
+            content=normalized_content,
             images=normalized_images,
             ugc_right=normalized_right,
             target_uins=normalized_targets,
+        )
+
+    async def send_generated_qzone_msg(
+        self,
+        content: str,
+        image_description: str,
+        image_style: Literal["photo", "drawing"] | None = None,
+        ugc_right: int = 1,
+        target_uins: list[int] | None = None,
+    ) -> QzoneResponse:
+        """等待配置的图片 Service 生成完成，再把正文与图片一次性发表。"""
+        normalized_content = str(content).strip()
+        if not normalized_content:
+            raise NeoFoxzoneError("AI 配图说说正文不能为空。")
+        try:
+            images = await generate_images(
+                self._config(),
+                image_description,
+                image_style,
+            )
+        except ImageProviderError as error:
+            raise NeoFoxzoneError(str(error)) from error
+        if not images:
+            raise NeoFoxzoneError("图片 Provider 未返回任何图片，已取消发布。")
+        return await self.send_qzone_msg(
+            content=normalized_content,
+            images=images,
+            ugc_right=ugc_right,
+            target_uins=target_uins,
         )
 
     async def delete_qzone_msg(self, tid: str) -> QzoneResponse:
@@ -218,8 +257,11 @@ class NeoFoxzoneService(BaseService):
     ) -> QzoneResponse:
         """对指定说说发表评论，可附带图片。"""
         normalized_images = self._normalize_images(images)
-        if not str(content).strip() and not normalized_images:
-            raise NeoFoxzoneError("评论正文与图片不能同时为空。")
+        normalized_content = str(content).strip()
+        if not normalized_content:
+            if not normalized_images:
+                raise NeoFoxzoneError("评论正文与图片不能同时为空。")
+            raise NeoFoxzoneError("当前 OneBot 后端要求评论正文不能为空。")
         normalized_target = (
             self._validate_user_id(target_uin, "target_uin")
             if target_uin is not None
@@ -227,7 +269,7 @@ class NeoFoxzoneService(BaseService):
         )
         return await self._backend().comment_qzone(
             tid=self._validate_tid(tid),
-            content=content,
+            content=normalized_content,
             target_uin=normalized_target,
             images=normalized_images,
         )

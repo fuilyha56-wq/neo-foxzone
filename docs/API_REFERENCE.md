@@ -40,12 +40,12 @@ async def get_qzone_msg_list(
 
 ```python
 async def get_qzone_feeds(
-    page_num: int = 0,
+    page_num: int = 1,
     count: int = 10,
 ) -> dict[str, Any]
 ```
 
-获取当前登录 QQ 可见的好友空间动态。
+获取当前登录 QQ 可见的好友空间动态。`page_num` 从 1 开始。
 
 ### `send_qzone_msg`
 
@@ -58,8 +58,24 @@ async def send_qzone_msg(
 ) -> dict[str, Any]
 ```
 
-发表说说。`content` 与 `images` 至少提供一项。`ugc_right` 为 `16` 或 `128`
-时必须提供 `target_uins`。
+发表说说，可附带图片。当前适配的 SnowLuma 后端要求 `content` 非空；
+`ugc_right` 为 `16` 或 `128` 时必须提供 `target_uins`。
+
+### `send_generated_qzone_msg`
+
+```python
+async def send_generated_qzone_msg(
+    content: str,
+    image_description: str,
+    image_style: Literal["photo", "drawing"] | None = None,
+    ugc_right: int = 1,
+    target_uins: list[int] | None = None,
+) -> dict[str, Any]
+```
+
+调用配置的图片 Provider，等待图片完整生成并归一化为 QZone 图片引用，然后只调用
+一次 `send_qzone_msg`，把正文与图片作为同一条说说发表。Provider 失败时抛出
+`NeoFoxzoneError`，不会先发布纯文字说说。
 
 ### `delete_qzone_msg`
 
@@ -102,8 +118,8 @@ async def comment_qzone(
 ) -> dict[str, Any]
 ```
 
-发表评论。`content` 与 `images` 至少提供一项。当前契约不支持父评论 ID，因此不能
-保证楼中楼定向回复。
+发表评论，可附带图片。当前适配的 SnowLuma 后端要求 `content` 非空。当前契约不
+支持父评论 ID，因此不能保证楼中楼定向回复。
 
 ### `set_qzone_ban`
 
@@ -153,6 +169,7 @@ service.response_error(response)
 ### Write Tools
 
 - `neo_foxzone_publish`
+- `neo_foxzone_publish_generated`
 - `neo_foxzone_delete`
 - `neo_foxzone_like`
 - `neo_foxzone_unlike`
@@ -175,3 +192,46 @@ Neo FoxZone Service 依赖：
 ```text
 onebot_expand:service:qzone_service
 ```
+
+Neo FoxZone 插件生命周期还依赖以下 Service 获取当前 Bot QQ：
+
+```text
+onebot_expand:service:account_service
+```
+
+## Image Provider Contract
+
+当 `image.provider = "service"` 时，配置的 Service 默认实现：
+
+```python
+async def generate_image_for_external(
+    *,
+    description: str,
+    style: Literal["photo", "drawing"],
+) -> str | list[str] | dict[str, Any] | None
+```
+
+Neo FoxZone 接受 URL、`file://`、`base64://`、Base64 data URI、裸 Base64、图片列表，
+以及包含 `images`、`image_refs`、`urls`、`image`、`image_ref`、`base64`、`url`
+或 `path` 的字典。方法名可通过 `image.service_method` 修改。Provider 的整个生成
+过程受 `image.timeout_seconds` 限制；超时会抛出 `ImageProviderError`，不会进入
+QZone 发布步骤。
+
+## Polling Runtime
+
+自动回复轮询不额外暴露组件签名，由插件生命周期使用 TaskManager 管理。启动时加载
+JSON 状态并按配置立即检查，之后按 `polling.interval_minutes` 重复执行。
+
+轮询在远端写入前持久化 `in_flight`，成功后逐条提交。明确失败会释放占用并按
+`polling.failure_retry_minutes` 退避；远端结果不明时保留占用，防止重启后重复回复。
+单轮成功数和尝试数分别由 `polling.max_replies_per_poll` 与
+`polling.max_attempts_per_poll` 限制。
+
+运营者命令：
+
+- `neofoxzone poll-now`：复用当前轮询器执行一次检查。
+- `neofoxzone poll-status`：查看最近一次报告。
+- `neofoxzone publish-ai`：调用 `send_generated_qzone_msg`。
+
+轮询只会处理响应中可证明关系的结构化评论。所需字段及协议限制见
+[COMPATIBILITY.md](COMPATIBILITY.md)。

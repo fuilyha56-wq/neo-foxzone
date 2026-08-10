@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable
-from typing import cast
+from typing import Literal, cast
 
 from src.app.plugin_system.api import service_api
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 
-from . import BACKEND_SERVICE_SIGNATURE, SERVICE_SIGNATURE
+from . import (
+    ACCOUNT_SERVICE_SIGNATURE,
+    BACKEND_SERVICE_SIGNATURE,
+    SERVICE_SIGNATURE,
+)
 from .config import NeoFoxzoneConfig
 from .service import NeoFoxzoneError, NeoFoxzoneService, QzoneResponse
 
@@ -101,6 +105,9 @@ class NeoFoxzoneCommand(BaseCommand):
             "/neofoxzone posts [pos] [num]\n"
             "/neofoxzone feeds [page_num] [count]\n"
             "/neofoxzone publish \"正文\" [图片逗号列表] [权限] [QQ逗号列表]\n"
+            "/neofoxzone publish-ai \"正文\" \"画面描述\" [photo|drawing] [权限] [QQ逗号列表]\n"
+            "/neofoxzone poll-now\n"
+            "/neofoxzone poll-status\n"
             "/neofoxzone delete <tid>\n"
             "/neofoxzone like <tid> [发布者QQ]\n"
             "/neofoxzone unlike <tid> [发布者QQ]\n"
@@ -115,10 +122,16 @@ class NeoFoxzoneCommand(BaseCommand):
         """检查 Neo FoxZone 与前置 Service 是否已注册。"""
         own_service = service_api.get_service(SERVICE_SIGNATURE)
         backend_service = service_api.get_service(BACKEND_SERVICE_SIGNATURE)
-        ready = own_service is not None and backend_service is not None
+        account_service = service_api.get_service(ACCOUNT_SERVICE_SIGNATURE)
+        ready = (
+            own_service is not None
+            and backend_service is not None
+            and account_service is not None
+        )
         return ready, (
             f"Neo FoxZone Service: {'已就绪' if own_service else '未注册'}\n"
-            f"OneBot Expand QZone Service: {'已就绪' if backend_service else '未注册'}"
+            f"OneBot Expand QZone Service: {'已就绪' if backend_service else '未注册'}\n"
+            f"OneBot Expand Account Service: {'已就绪' if account_service else '未注册'}"
         )
 
     @cmd_route("posts")
@@ -137,7 +150,7 @@ class NeoFoxzoneCommand(BaseCommand):
     @cmd_route("feeds")
     async def handle_feeds(
         self,
-        page_num: int = 0,
+        page_num: int = 1,
         count: int = 10,
     ) -> tuple[bool, str]:
         """获取好友空间动态。"""
@@ -166,6 +179,85 @@ class NeoFoxzoneCommand(BaseCommand):
             ),
             "说说发表成功。",
         )
+
+    @cmd_route("publish-ai")
+    async def handle_publish_ai(
+        self,
+        content: str,
+        image_description: str,
+        image_style: str = "drawing",
+        ugc_right: int = 1,
+        target_uins: str = "",
+    ) -> tuple[bool, str]:
+        """等待配置的图片 Provider 完成生图后发表图文说说。"""
+        raw_style = image_style.strip().lower()
+        if raw_style not in {"photo", "drawing"}:
+            return False, "图片风格仅支持 photo 或 drawing。"
+        normalized_style = cast(Literal["photo", "drawing"], raw_style)
+        service = self._service()
+        return await self._run(
+            service.send_generated_qzone_msg(
+                content=content,
+                image_description=image_description,
+                image_style=normalized_style,
+                ugc_right=ugc_right,
+                target_uins=_parse_int_list(target_uins),
+            ),
+            "AI 配图说说发表成功。",
+        )
+
+    @staticmethod
+    def _format_poll_report(report: object) -> str:
+        """把自动回复轮询报告格式化为运营者可读文本。"""
+        query_errors = list(getattr(report, "query_errors", []) or [])
+        reply_errors = list(getattr(report, "reply_errors", []) or [])
+        lines = [
+            "说说评论检查完成。",
+            (
+                f"候选={int(getattr(report, 'candidates', 0))}，"
+                f"已跳过={int(getattr(report, 'skipped_processed', 0))}，"
+                f"处理中={int(getattr(report, 'skipped_in_flight', 0))}，"
+                f"退避={int(getattr(report, 'skipped_backoff', 0))}，"
+                f"回复={int(getattr(report, 'replied', 0))}，"
+                f"失败={int(getattr(report, 'failed', 0))}"
+            ),
+        ]
+        if query_errors:
+            lines.append("查询错误：" + "；".join(str(item) for item in query_errors))
+        if reply_errors:
+            lines.append("回复错误：" + "；".join(str(item) for item in reply_errors))
+        state_errors = list(getattr(report, "state_errors", []) or [])
+        if state_errors:
+            lines.append("状态错误：" + "；".join(str(item) for item in state_errors))
+        return "\n".join(lines)
+
+    @cmd_route("poll-now")
+    async def handle_poll_now(self) -> tuple[bool, str]:
+        """立即复用当前轮询器检查一次未回复评论。"""
+        poll_now = getattr(self.plugin, "poll_now", None)
+        if poll_now is None or not callable(poll_now):
+            return False, "当前插件实例不支持手动轮询。"
+        try:
+            report = await poll_now()
+        except Exception as error:
+            return False, f"说说评论检查失败: {error}"
+        success = (
+            not getattr(report, "query_errors", [])
+            and not getattr(report, "state_errors", [])
+            and int(getattr(report, "failed", 0)) == 0
+        )
+        return success, self._format_poll_report(report)
+
+    @cmd_route("poll-status")
+    async def handle_poll_status(self) -> tuple[bool, str]:
+        """查看最近一次自动或手动轮询报告。"""
+        get_report = getattr(self.plugin, "get_poll_report", None)
+        if get_report is None or not callable(get_report):
+            return False, "当前插件实例不支持轮询状态查询。"
+        report = get_report()
+        if report is None:
+            return False, "尚无轮询报告，或自动回复轮询未启用。"
+        return True, self._format_poll_report(report)
 
     @cmd_route("delete")
     async def handle_delete(self, tid: str) -> tuple[bool, str]:

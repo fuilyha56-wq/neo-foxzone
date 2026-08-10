@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from src.app.plugin_system.api import service_api
 from src.app.plugin_system.base import BaseTool
@@ -75,7 +75,7 @@ class NeoFoxzoneListFeedsTool(BaseTool):
 
     async def execute(
         self,
-        page_num: Annotated[int, "页码，从 0 开始"] = 0,
+        page_num: Annotated[int, "页码，从 1 开始"] = 1,
         count: Annotated[int, "每页数量"] = 10,
     ) -> ToolResult:
         """获取好友空间动态。"""
@@ -89,7 +89,7 @@ class NeoFoxzoneListFeedsTool(BaseTool):
 
 
 class NeoFoxzonePublishTool(BaseTool):
-    """发表文字或图片说说。"""
+    """发表说说，可附带图片。"""
 
     tool_name = "neo_foxzone_publish"
     tool_description = "发表 QQ 空间说说，可附图并设置查看权限"
@@ -122,6 +122,48 @@ class NeoFoxzonePublishTool(BaseTool):
             lambda service: service.send_qzone_msg(
                 content=content,
                 images=images,
+                ugc_right=ugc_right,
+                target_uins=target_uins,
+            ),
+        )
+
+
+class NeoFoxzonePublishGeneratedTool(BaseTool):
+    """等待图片 Service 生成完成后发表图文说说。"""
+
+    tool_name = "neo_foxzone_publish_generated"
+    tool_description = "根据画面描述生成图片，并与正文一次性发表 QQ 空间说说"
+    name = "neo_foxzone_publish_generated"
+    description = (
+        "调用 Neo FoxZone 配置的图片 Provider，等待图片完整生成后，"
+        "再把正文和图片作为同一条 QQ 空间说说发表"
+    )
+    dependencies = [SERVICE_SIGNATURE]
+
+    async def execute(
+        self,
+        content: Annotated[str, "说说正文"],
+        image_description: Annotated[str, "要生成的画面自然语言描述"],
+        image_style: Annotated[
+            Literal["photo", "drawing"],
+            "图片风格：photo 或 drawing",
+        ] = "drawing",
+        ugc_right: Annotated[
+            int,
+            "查看权限：1所有人、4好友、16部分好友、64仅自己、128部分好友不可见",
+        ] = 1,
+        target_uins: Annotated[
+            list[int] | None,
+            "权限目标 QQ 列表；ugc_right 为 16 或 128 时必填",
+        ] = None,
+    ) -> ToolResult:
+        """生成图片并发表说说。"""
+        return await _run_tool(
+            "send_generated_qzone_msg",
+            lambda service: service.send_generated_qzone_msg(
+                content=content,
+                image_description=image_description,
+                image_style=image_style,
                 ugc_right=ugc_right,
                 target_uins=target_uins,
             ),
@@ -293,6 +335,7 @@ READ_TOOLS: list[type[BaseTool]] = [
 
 WRITE_TOOLS: list[type[BaseTool]] = [
     NeoFoxzonePublishTool,
+    NeoFoxzonePublishGeneratedTool,
     NeoFoxzoneDeleteTool,
     NeoFoxzoneLikeTool,
     NeoFoxzoneUnlikeTool,
@@ -310,6 +353,7 @@ __all__ = [
     "NeoFoxzoneLikeTool",
     "NeoFoxzoneListFeedsTool",
     "NeoFoxzoneListPostsTool",
+    "NeoFoxzonePublishGeneratedTool",
     "NeoFoxzonePublishTool",
     "NeoFoxzoneSetBlacklistTool",
     "NeoFoxzoneSetVisibilityTool",

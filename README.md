@@ -1,15 +1,16 @@
 # Neo FoxZone
 
-Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。它以
+Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。当前版本为 `0.1.0`。它以
 [OneBot Expand](https://github.com/fuilyha56-wq/onebot_expand) 为硬前置，
-通过 `onebot_expand:service:qzone_service` 调用 OneBot 协议端，不读取、保存或
-刷新 QQ 空间 Cookie，也不依赖 `p_skey`、`skey` 或浏览器私有 HTTP 接口。
+通过 QZone Service 调用 OneBot 协议端，并通过 Account Service 识别当前 Bot QQ；
+插件不读取、保存或刷新 QQ 空间 Cookie，也不依赖 `p_skey`、`skey` 或浏览器私有
+HTTP 接口。
 
 插件完整封装 OneBot Expand 当前公开的 9 项 QQ 空间能力：
 
 - 获取当前 QQ 的说说列表
 - 获取好友空间动态
-- 发表文字或图片说说
+- 发表说说，可附带图片
 - 删除说说
 - 点赞说说
 - 取消点赞
@@ -17,7 +18,16 @@ Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。它以
 - 拉黑或解除拉黑空间用户
 - 修改已发布说说的查看权限
 
-每项能力都可以通过插件 Service 调用；默认还提供 9 个 LLM Tool 和一套仅
+在这 9 项协议能力之上，`0.1.0` 还提供：
+
+- 插件启动后立即检查未回复评论，之后默认每 30 分钟轮询一次。
+- 持久记录已处理评论，重启后不会重复回复。
+- 对自己的说说处理尚未被 Bot 回复的评论。
+- 对他人的说说只恢复能够证明为“直接回复 Bot 评论”的对话。
+- 可替换图片 Provider；当前内置 `nai_artist` 适配器与通用 Service 适配器。
+- 等待图片完全生成后，再把图片和正文作为同一条说说一次性发布。
+
+每项基础能力都可以通过插件 Service 调用；默认还提供 10 个 LLM Tool 和一套仅
 `OPERATOR` 可使用的 `/neofoxzone` 管理命令。
 
 ## 为什么使用 Neo FoxZone
@@ -39,6 +49,27 @@ onebot_expand:service:qzone_service
             |
             v
 OneBot Adapter -> NapCat / SnowLuma / 兼容实现
+```
+
+自动回复还会调用：
+
+```text
+onebot_expand:service:account_service -> get_login_info -> Bot QQ
+```
+
+AI 配图发布使用可选链路：
+
+```text
+neo_foxzone_publish_generated / publish-ai
+            |
+            v
+Neo FoxZone Image Provider
+            |
+            +-- nai_artist 适配器
+            +-- 任意实现统一接口的 Service
+            |
+            v
+等待生成完成 -> send_qzone_msg(正文, 图片)
 ```
 
 这意味着：
@@ -65,7 +96,8 @@ OneBot Adapter -> NapCat / SnowLuma / 兼容实现
       "onebot_expand>=1.0.13"
     ],
     "components": [
-      "onebot_expand:service:qzone_service"
+      "onebot_expand:service:qzone_service",
+      "onebot_expand:service:account_service"
     ]
   },
   "dependencies_required": true
@@ -100,9 +132,15 @@ Neo FoxZone 提供的组件始终完整，但功能是否能成功执行还取�
 | 空间黑名单 | `set_qzone_ban` | 支持 | 部分版本未实现 |
 | 修改查看权限 | `set_qzone_msg_right` | 支持 | 部分版本未实现 |
 
-需要九项能力全部实机可用时，推荐使用已实现全部 action 的 SnowLuma。NapCat
+需要九项基础能力全部实机可用时，推荐使用已实现全部 action 的 SnowLuma。NapCat
 未实现的 action 通常会返回 `failed` 或 `retcode=1404`；Neo FoxZone 会原样报告，
 不会伪装成功，也不会退回 Cookie 私有接口。
+
+自动回复比基础 action 还多一个前提：查询响应必须包含结构化评论明细。至少需要
+评论 ID、评论者 QQ、正文；恢复他人说说中的对话还需要父评论 ID 或明确的被回复
+QQ。当前 SnowLuma 的 `get_qzone_msg_list` 规范化结果只保留 `comment_num`，好友动态
+主要返回预渲染 HTML，因此现行版本不保证能提供自动回复所需字段。字段缺失时插件
+会完成轮询但不猜测评论，也不会误发回复。
 
 更详细的边界说明见 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)。
 
@@ -113,7 +151,7 @@ Neo FoxZone 提供的组件始终完整，但功能是否能成功执行还取�
 1. 在 Neo-MoFox 插件市场搜索 `neo-foxzone`。
 2. 确认详情页的前置依赖包含 `onebot_expand>=1.0.13`。
 3. 安装并重启 Neo-MoFox。
-4. 执行 `/neofoxzone status` 检查两个 Service。
+4. 执行 `/neofoxzone status` 检查三个 Service。
 
 如果市场没有自动安装前置插件，请先安装 OneBot Expand，再安装 Neo FoxZone。
 
@@ -150,13 +188,14 @@ uv run main.py
 ```text
 Neo FoxZone Service: 已就绪
 OneBot Expand QZone Service: 已就绪
+OneBot Expand Account Service: 已就绪
 ```
 
 接着可以先执行无副作用的查询：
 
 ```text
 /neofoxzone posts 0 10
-/neofoxzone feeds 0 10
+/neofoxzone feeds 1 10
 ```
 
 ## 管理命令
@@ -194,8 +233,11 @@ OneBot Expand QZone Service: 已就绪
 示例：
 
 ```text
-/neofoxzone feeds 0 10
+/neofoxzone feeds 1 10
 ```
+
+`page_num` 从 1 开始，`count` 默认 10，最大值由配置中的
+`max_query_count` 决定。
 
 ### 发表说说
 
@@ -221,11 +263,34 @@ OneBot Expand QZone Service: 已就绪
 /neofoxzone publish "小范围记录" "" 16 "10001,10002"
 ```
 
-发表纯图片说说时，正文参数仍需保留为空字符串：
+当前 SnowLuma 的 `send_qzone_msg` 要求正文非空，因此 Neo FoxZone 不宣称支持纯图片
+说说；带图发布也必须提供非空正文。
+
+### 生成配图后发表
 
 ```text
-/neofoxzone publish "" "file:///D:/Pictures/qzone.jpg"
+/neofoxzone publish-ai "正文" "画面描述" [photo|drawing] [ugc_right] [QQ逗号列表]
 ```
+
+示例：
+
+```text
+/neofoxzone publish-ai "雨停后的街角" "雨夜后的城市街角，霓虹倒映在积水里" drawing
+/neofoxzone publish-ai "今天的晨光" "坐在窗边喝咖啡的自然抓拍" photo 4
+```
+
+命令会先等待配置的图片 Provider 完整返回图片，再调用一次 `send_qzone_msg`。不会先
+发布文字、稍后补图。Provider 失败时不会发布半成品说说。
+
+### 手动检查评论
+
+```text
+/neofoxzone poll-now
+/neofoxzone poll-status
+```
+
+`poll-now` 复用正在运行的轮询器和互斥锁，不会另建第二个后台任务；`poll-status`
+显示最近一次自动或手动检查的候选数、跳过数、回复数和失败数。
 
 ### 删除说说
 
@@ -335,6 +400,64 @@ base64://<BASE64_DATA>
 - 默认每条说说或评论最多 9 张图，可在配置中修改。
 - 图片引用中的逗号会被管理命令视为分隔符；复杂数据建议通过 Tool 或 Service 调用。
 
+## AI 图片 Provider
+
+`image.provider` 支持三种模式：
+
+| 值 | 行为 |
+| --- | --- |
+| `nai_artist` | 默认值，适配现有 NAI Artist Service；`nai_artist` 不是硬依赖 |
+| `service` | 调用配置签名下的任意通用图片 Service |
+| `disabled` | 禁用 AI 配图发布，不影响其他 QZone 功能 |
+
+### NAI Artist 适配
+
+Neo FoxZone 会复用 NAI Artist 自己的配置、自然语言转 tags 逻辑和可选衣柜上下文，
+调用 `generate_image` 并等待其完成。NAI 返回的裸 Base64 会转换为 QZone 可识别的
+`base64://` 引用。未安装或未启用 NAI Artist 时，只有 AI 配图发布会失败；Neo
+FoxZone 的查询、普通发布和轮询仍可使用。
+
+### 通用 Service 契约
+
+配置 `image.provider = "service"` 后，目标 Service 默认需要实现：
+
+```python
+from typing import Any, Literal
+
+
+async def generate_image_for_external(
+    *,
+    description: str,
+    style: Literal["photo", "drawing"],
+) -> str | list[str] | dict[str, Any] | None:
+    ...
+```
+
+返回值可以是 `http(s)://`、`file://`、`base64://`、Base64 data URI、裸 Base64、
+图片列表，或包含 `images`、`image`、`url`、`base64` 等字段的字典。方法名可通过
+`image.service_method` 修改。整个生成流程受 `image.timeout_seconds` 限制，默认
+等待 180 秒；超时后不会继续发布纯文字说说。
+
+## 自动回复轮询
+
+插件加载后会读取 `data/json_storage/neo-foxzone/polling_state.json`，默认立即检查
+一次，然后每 30 分钟检查一次。远端发送前会先持久化 `in_flight` 占用，成功后再
+逐条提交已处理状态；本地状态无法落盘时不会发送。若远端调用抛出超时等结果不明
+异常，插件会保留占用以防重启后重复评论，需要运营者结合协议端记录人工核对。
+LLM 或协议明确返回失败时会释放占用，并按指数退避留给后续轮询重试。
+
+安全判据如下：
+
+- 自己的说说：选择非 Bot 用户评论，且其明确子评论中没有 Bot 回复。
+- 他人的说说：只接受父评论 ID 指向已知 Bot 评论，或响应明确给出
+  `reply_to_uin=Bot QQ` 的评论。
+- 已经能看到 Bot 子回复的线程不会再次回复。
+- 单轮默认最多成功回复 5 条、尝试 10 条，并轮转候选，避免失败前缀饿死后续评论。
+- `comment_qzone` 没有父评论参数，因此发布的是说说下普通评论，不宣称是真正楼中楼。
+
+自动回复使用 `polling.model_task` 指定的模型任务，默认 `utils_small`。评论文本作为
+不可信上下文发送给模型，回复截断长度由 `polling.max_reply_chars` 控制。
+
 ## LLM Tool
 
 默认注册以下 Tool：
@@ -344,6 +467,7 @@ base64://<BASE64_DATA>
 | `neo_foxzone_list_posts` | 获取当前 QQ 的说说列表 |
 | `neo_foxzone_list_feeds` | 获取好友动态 |
 | `neo_foxzone_publish` | 发表文字或图片说说 |
+| `neo_foxzone_publish_generated` | 等待图片生成完成后发表图文说说 |
 | `neo_foxzone_delete` | 删除说说 |
 | `neo_foxzone_like` | 点赞 |
 | `neo_foxzone_unlike` | 取消点赞 |
@@ -378,7 +502,7 @@ neo-foxzone:service:neo_foxzone_service
 其他插件应在自己的 manifest 和组件类中声明依赖，然后通过 `service_api` 获取：
 
 ```python
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from src.app.plugin_system.api import service_api
 
@@ -390,6 +514,15 @@ class NeoFoxzoneServiceLike(Protocol):
         images: list[str] | None = None,
         ugc_right: int = 1,
         target_uins: list[int] | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def send_generated_qzone_msg(
+      self,
+      content: str,
+      image_description: str,
+      image_style: Literal["photo", "drawing"] | None = None,
+      ugc_right: int = 1,
+      target_uins: list[int] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -425,6 +558,26 @@ command_enabled = true
 read_tools_enabled = true
 write_tools_enabled = true
 
+[image]
+provider = "nai_artist"
+service_signature = ""
+service_method = "generate_image_for_external"
+default_style = "drawing"
+timeout_seconds = 180.0
+
+[polling]
+enabled = true
+startup_check = true
+interval_minutes = 30.0
+own_posts_count = 20
+friend_feeds_count = 20
+max_replies_per_poll = 5
+max_attempts_per_poll = 10
+failure_retry_minutes = 30.0
+state_max_entries = 2000
+model_task = "utils_small"
+max_reply_chars = 180
+
 [limits]
 max_query_count = 50
 max_images = 9
@@ -436,7 +589,23 @@ max_command_output_chars = 12000
 | `plugin.enabled` | `true` | 插件总开关 |
 | `components.command_enabled` | `true` | 注册管理命令 |
 | `components.read_tools_enabled` | `true` | 注册两个查询 Tool |
-| `components.write_tools_enabled` | `true` | 注册七个写操作 Tool |
+| `components.write_tools_enabled` | `true` | 注册八个写操作 Tool |
+| `image.provider` | `nai_artist` | 图片 Provider；可选 `service` 或 `disabled` |
+| `image.service_signature` | 空 | 通用图片 Service 组件签名 |
+| `image.service_method` | `generate_image_for_external` | 通用图片方法名 |
+| `image.default_style` | `drawing` | 默认生图风格 |
+| `image.timeout_seconds` | `180.0` | 等待图片生成完成的超时秒数 |
+| `polling.enabled` | `true` | 启用评论自动检查与回复 |
+| `polling.startup_check` | `true` | 每次插件加载后立即检查 |
+| `polling.interval_minutes` | `30.0` | 定时检查间隔（分钟） |
+| `polling.own_posts_count` | `20` | 每轮获取自己的最近说说数 |
+| `polling.friend_feeds_count` | `20` | 每轮获取好友动态数 |
+| `polling.max_replies_per_poll` | `5` | 单轮最大成功自动回复数 |
+| `polling.max_attempts_per_poll` | `10` | 单轮最大生成或发送尝试数 |
+| `polling.failure_retry_minutes` | `30.0` | 明确失败后的基础退避分钟数 |
+| `polling.state_max_entries` | `2000` | 已处理、占用、退避与 Bot 评论记录上限 |
+| `polling.model_task` | `utils_small` | 自动回复模型任务 |
+| `polling.max_reply_chars` | `180` | 自动回复字符上限 |
 | `limits.max_query_count` | `50` | 单次查询最大条数 |
 | `limits.max_images` | `9` | 单次调用最大图片数 |
 | `limits.max_command_output_chars` | `12000` | 命令原始 JSON 输出上限 |
@@ -487,6 +656,18 @@ mpdt depend list .
 确认图片 URI 能由协议端访问。容器、远程协议端和宿主机之间的本地文件路径并不
 天然互通；优先使用可访问的 HTTP URL 或 `base64://`。
 
+### `publish-ai` 提示图片 Service 未注册
+
+默认 Provider 是 `nai_artist`，但它不是硬依赖。请安装并启用 NAI Artist，或把
+`image.provider` 改为 `service` 并配置 `image.service_signature`，也可以改为
+`disabled` 关闭 AI 配图入口。
+
+### 轮询运行但没有自动回复
+
+先执行 `/neofoxzone poll-now` 查看查询错误。若候选数始终为 0，而说说确有评论，
+通常是协议端查询响应没有返回结构化评论明细。仅有 `comment_num` 或 HTML 不足以
+安全识别评论 ID、作者与父回复关系；Neo FoxZone 不会从模糊文本猜测后自动发言。
+
 ### 无法获取任意指定 QQ 的历史说说
 
 OneBot Expand 当前的 `get_qzone_msg_list` 只查询当前登录 QQ，没有 `target_uin`
@@ -530,6 +711,11 @@ mpdt plugin build plugins/neo-foxzone
 
 - 9 个 QZone action 的参数转发
 - 图片-only 说说与评论
+- 通用图片返回归一化与等待生图后单次发布
+- 评论树归一化、直接回复判据和跨重启恢复
+- JSON 持久去重与容量裁剪
+- 启动立即检查、TaskManager 注册和卸载取消
+- AI 发布 Tool、管理命令和手动轮询入口
 - 查看权限和 QQ 名单校验
 - 前置 Service 缺失错误
 - Tool 与命令调用路径
@@ -540,6 +726,11 @@ mpdt plugin build plugins/neo-foxzone
 
 - 插件不读取、保存或记录 QQ Cookie。
 - 插件不包含 API 密钥、Token 或账号密码。
+- 自动回复状态只保存评论身份、说说联合键和 Bot 评论 ID，不保存 Cookie。
+- 自动回复会把说说正文、父评论和当前评论发送给 `polling.model_task` 选择的 LLM；
+  请按模型提供方的数据政策评估隐私。
+- `publish-ai` 会把画面描述发送给配置的图片 Provider；`nai_artist` 使用其自身配置的
+  翻译模型与生图后端。
 - 命令返回的是协议端响应，可能包含 QQ 号、说说内容和图片地址；不要把日志公开到
   不可信环境。
 - 发布、删除、点赞、评论、拉黑和权限修改都是真实写操作。建议先在测试账号或测试

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 class OneBotQzoneService(Protocol):
@@ -18,7 +18,7 @@ class OneBotQzoneService(Protocol):
 
     async def get_qzone_feeds(
         self,
-        page_num: int = 0,
+        page_num: int = 1,
         count: int = 10,
     ) -> dict[str, Any]:
         """获取好友动态。"""
@@ -82,4 +82,17 @@ class OneBotQzoneService(Protocol):
         ...
 
 
-__all__ = ["OneBotQzoneService"]
+class ExternalImageService(Protocol):
+    """其他插件可实现的通用图片生成接口。"""
+
+    async def generate_image_for_external(
+        self,
+        *,
+        description: str,
+        style: Literal["photo", "drawing"],
+    ) -> str | list[str] | dict[str, Any] | None:
+        """生成图片并返回图片引用、裸 Base64 或结构化结果。"""
+        ...
+
+
+__all__ = ["ExternalImageService", "OneBotQzoneService"]

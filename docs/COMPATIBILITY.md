@@ -26,6 +26,27 @@ Neo FoxZone 的“全功能”指完整覆盖 OneBot Expand `1.0.13` 的 QZone S
 
 ## Known Protocol Limits
 
+### Automatic replies require structured comments
+
+自动回复不是由 `comment_num` 推断。协议查询响应至少需要提供：
+
+- 说说 ID：`tid`、`key` 等。
+- 评论 ID：明确的 `comment_id`、`commentid`；好友动态适配器还接受 `id`。
+- 评论者 QQ 与评论正文。
+- 对他人说说恢复对话时，还需要父评论 ID 或明确的被回复 QQ。
+
+Neo FoxZone 会兼容 `commentlist`、`comments`、`list_3` 等常见结构，但不会从模糊
+HTML、`children` 等泛化字段或评论计数猜测作者和回复关系，也不会把说说的 `tid`、
+`key` 或 `target_uin` 当成评论关系。字段不足或关系冲突时只会得到 0 个候选。
+
+当前 SnowLuma 的公开返回映射中：
+
+- `get_qzone_msg_list` 只保留 `comment_num`，未保留 CGI 返回的评论明细。
+- `get_qzone_feeds` 主要提供预渲染 `html`，未规范化评论树。
+
+因此 SnowLuma 当前版本可以完成九项基础 action，但不保证能驱动 Neo FoxZone 自动
+回复。协议端未来若提供结构化评论字段，Neo FoxZone 无需修改基础 action 即可识别。
+
 ### No arbitrary-user post-list query
 
 `get_qzone_msg_list` 只有 `pos` 和 `num`，查询当前登录 QQ 的说说。它不接受
@@ -39,6 +60,13 @@ Neo FoxZone 的“全功能”指完整覆盖 OneBot Expand `1.0.13` 的 QZone S
 ### No nested-comment target
 
 `comment_qzone` 不接受父评论 ID 或被回复评论 ID，无法保证定向回复某条评论。
+自动回复即使识别了父子关系，最终也只能在目标说说下发表普通评论，不会伪装成真正
+楼中楼回复。
+
+### Non-empty content on SnowLuma
+
+当前 SnowLuma 的 `send_qzone_msg` 与 `comment_qzone` schema 要求 `content` 非空。
+Neo FoxZone 因此要求带图说说和带图评论也提供非空正文，不宣称支持纯图片发布。
 
 ### Backend paths differ
 
@@ -64,6 +92,7 @@ Service 始终返回原始响应；Tool 和 Command 在原始响应之外增加�
 
 ## Verification Strategy
 
-自动测试使用一个严格记录参数的 OneBot Expand 替身，验证 9 个 action 均被调用且
-参数未丢失。只读 action 可以在真实协议端直接冒烟测试；发布、删除、点赞、评论、
-拉黑和权限修改会产生真实副作用，应在测试账号或测试说说上手动验证。
+自动测试使用严格替身验证 9 个 action 均被调用且参数未丢失，并覆盖评论结构
+归一化、跨重启去重、启动任务生命周期、生成后单次发布与可替换图片 Provider。
+只读 action 可以在真实协议端直接冒烟测试；发布、删除、点赞、评论、拉黑、权限
+修改和自动回复会产生真实副作用，应在测试账号或测试说说上手动验证。

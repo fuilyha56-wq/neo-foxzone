@@ -2,7 +2,7 @@
   "name": "neo-foxzone",
   "display_name": "Neo FoxZone",
   "version": "0.1.0",
-  "description": "基于 OneBot Expand 的 QQ 空间说说全功能插件，无需 Cookie，支持查询、发布、删除、点赞、评论、黑名单与可见权限管理",
+  "description": "基于 OneBot Expand 的 QQ 空间说说插件，支持完整管理、评论轮询自动回复与可替换 AI 生图发布",
   "author": "MoFox Team",
   "license": "AGPL-3.0",
   "dependencies": {
@@ -10,7 +10,8 @@
       "onebot_expand>=1.0.13"
     ],
     "components": [
-      "onebot_expand:service:qzone_service"
+      "onebot_expand:service:qzone_service",
+      "onebot_expand:service:account_service"
     ]
   },
   "include": [
@@ -49,6 +50,14 @@
     {
       "component_type": "tool",
       "component_name": "neo_foxzone_publish",
+      "dependencies": [
+        "neo-foxzone:service:neo_foxzone_service"
+      ],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "neo_foxzone_publish_generated",
       "dependencies": [
         "neo-foxzone:service:neo_foxzone_service"
       ],
