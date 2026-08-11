@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from src.app.plugin_system.api import service_api
@@ -23,6 +24,13 @@ from .service import NeoFoxzoneService
 from .tools import READ_TOOLS, WRITE_TOOLS
 
 logger = get_logger("neo_foxzone.plugin")
+
+
+def _interval_label(interval_seconds: float) -> str:
+    """把轮询秒数格式化为适合日志展示的时间间隔。"""
+    if interval_seconds >= 60.0 and interval_seconds % 60.0 == 0:
+        return f"{int(interval_seconds / 60.0)} 分钟"
+    return f"{interval_seconds:g} 秒"
 
 
 @register_plugin
@@ -73,6 +81,10 @@ class NeoFoxzonePlugin(BasePlugin):
             return
         config = self._config().polling
         if config.startup_check:
+            logger.info(
+                "Neo FoxZone 启动检查开始: "
+                "正在读取自身说说与好友动态并检查可回复评论。"
+            )
             try:
                 report = await poller.poll_once()
                 logger.info(
@@ -80,6 +92,8 @@ class NeoFoxzonePlugin(BasePlugin):
                     f"候选={report.candidates}, 回复={report.replied}, "
                     f"失败={report.failed}, 查询错误={len(report.query_errors)}"
                 )
+                for error in report.query_errors:
+                    logger.warning(f"Neo FoxZone 启动检查查询错误: {error}")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -87,10 +101,24 @@ class NeoFoxzonePlugin(BasePlugin):
                     f"Neo FoxZone 启动检查异常: {error}",
                     exc_info=error,
                 )
+        else:
+            logger.info("Neo FoxZone 已按配置跳过启动检查。")
 
         while True:
             interval_seconds = max(1.0, float(config.interval_minutes) * 60.0)
+            interval = _interval_label(interval_seconds)
+            next_run = datetime.now().astimezone() + timedelta(
+                seconds=interval_seconds
+            )
+            logger.info(
+                f"Neo FoxZone 下次定时检查将在 {interval}后执行: "
+                f"预计时间={next_run:%Y-%m-%d %H:%M:%S %z}。"
+            )
             await asyncio.sleep(interval_seconds)
+            logger.info(
+                "Neo FoxZone 定时检查开始: "
+                "正在读取自身说说与好友动态并检查可回复评论。"
+            )
             try:
                 report = await poller.poll_once()
                 logger.info(
@@ -98,6 +126,8 @@ class NeoFoxzonePlugin(BasePlugin):
                     f"候选={report.candidates}, 回复={report.replied}, "
                     f"失败={report.failed}, 查询错误={len(report.query_errors)}"
                 )
+                for error in report.query_errors:
+                    logger.warning(f"Neo FoxZone 定时检查查询错误: {error}")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -110,6 +140,11 @@ class NeoFoxzonePlugin(BasePlugin):
         """加载持久状态并注册自动回复守护任务。"""
         config = self._config()
         if not config.plugin.enabled or not config.polling.enabled:
+            logger.info(
+                "Neo FoxZone 自动回复轮询未启动: "
+                f"plugin.enabled={config.plugin.enabled}, "
+                f"polling.enabled={config.polling.enabled}。"
+            )
             return
         raw_service = service_api.get_service(SERVICE_SIGNATURE)
         if raw_service is None:
@@ -137,6 +172,15 @@ class NeoFoxzonePlugin(BasePlugin):
         )
         self._poll_task_id = task.task_id
         self._poll_task = task.task
+        logger.info(
+            "Neo FoxZone 自动回复轮询已启动: "
+            f"启动检查={config.polling.startup_check}, "
+            f"间隔={config.polling.interval_minutes:g} 分钟, "
+            f"自身说说={config.polling.own_posts_count} 条, "
+            f"好友动态={config.polling.friend_feeds_count} 条, "
+            f"单轮最多回复={config.polling.max_replies_per_poll} 条, "
+            f"任务ID={task.task_id}。"
+        )
 
     async def on_plugin_unloaded(self) -> None:
         """取消自动回复守护任务并清理运行时引用。"""

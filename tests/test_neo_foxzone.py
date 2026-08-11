@@ -841,6 +841,19 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
     PollingState = state_module.PollingState
     saved: dict[str, Any] = {}
     snapshots: list[dict[str, Any]] = []
+    messages: list[str] = []
+
+    class FakeLogger:
+        """收集候选决策与发送日志。"""
+
+        def info(self, message: str) -> None:
+            messages.append(message)
+
+        def warning(self, message: str) -> None:
+            messages.append(message)
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            messages.append(message)
 
     async def save_json(
         store_name: str,
@@ -853,6 +866,7 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
         snapshots.append(json.loads(json.dumps(data)))
 
     monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+    monkeypatch.setattr(poller_module, "logger", FakeLogger())
 
     class FakePollingService:
         """提供一条旧评论与一条新评论的 QZone Service。"""
@@ -972,6 +986,115 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
     assert saved["processed_comment_ids"][-1].endswith("new-comment")
     assert saved["in_flight_comment_ids"] == []
     assert len(snapshots) == 2
+    assert any(
+        "评论ID=new-comment" in message
+        and "决策=生成并发送回复" in message
+        for message in messages
+    )
+    assert any(
+        "自动回复生成完成" in message
+        and "回复 新评论" in message
+        for message in messages
+    )
+    assert any(
+        "自动回复发送成功" in message
+        and "Bot评论ID=bot-comment-new" in message
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_poller_logs_query_shape_and_safe_skip_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺少结构化评论时应明确记录读取结果和安全跳过原因。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    messages: list[str] = []
+
+    class FakeLogger:
+        """收集轮询器信息日志。"""
+
+        def info(self, message: str) -> None:
+            messages.append(message)
+
+        def warning(self, message: str) -> None:
+            messages.append(message)
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            messages.append(message)
+
+    class ShapeOnlyService:
+        """模拟只返回评论数量与预渲染 HTML 的协议端。"""
+
+        async def get_qzone_msg_list(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "msglist": [
+                        {
+                            "tid": "own-post",
+                            "content": "只有评论数量",
+                            "comment_num": 2,
+                        }
+                    ]
+                },
+            }
+
+        async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "feeds": [
+                        {
+                            "uin": 20001,
+                            "key": "friend-post",
+                            "html": "<li>预渲染动态</li>",
+                        }
+                    ]
+                },
+            }
+
+        async def comment_qzone(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("无结构化候选时不应发表评论")
+
+    monkeypatch.setattr(poller_module, "logger", FakeLogger())
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=NeoFoxzoneConfig()),
+        service=ShapeOnlyService(),
+        state=state_module.PollingState(),
+        bot_uin_loader=lambda: asyncio.sleep(0, result=99999),
+    )
+
+    report = await poller.poll_once()
+
+    assert report.candidates == 0
+    assert any(
+        "自身说说读取完成" in message
+        and "返回说说=1" in message
+        and "声明评论=2" in message
+        and "结构化评论=0" in message
+        for message in messages
+    )
+    assert any(
+        "协议仅返回评论数量" in message
+        and "决策=不回复" in message
+        for message in messages
+    )
+    assert any(
+        "好友动态读取完成" in message
+        and "返回动态=1" in message
+        and "HTML动态=1" in message
+        for message in messages
+    )
+    assert any(
+        "协议返回预渲染 HTML" in message
+        and "决策=不回复" in message
+        for message in messages
+    )
+    assert any("本轮没有可安全回复的评论候选" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -1281,6 +1404,19 @@ async def test_poll_loop_survives_startup_check_exception(
 ) -> None:
     """启动检查异常应被记录，不能让守护循环直接退出。"""
     plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
+    messages: list[str] = []
+
+    class FakeLogger:
+        """收集轮询调度日志。"""
+
+        def info(self, message: str) -> None:
+            messages.append(message)
+
+        def warning(self, message: str) -> None:
+            messages.append(message)
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            messages.append(message)
 
     class FakePoller:
         def __init__(self) -> None:
@@ -1307,12 +1443,19 @@ async def test_poll_loop_survives_startup_check_exception(
         if sleeps > 1:
             raise asyncio.CancelledError
 
+    monkeypatch.setattr(plugin_module, "logger", FakeLogger())
     monkeypatch.setattr(plugin_module.asyncio, "sleep", run_one_interval)
 
     with pytest.raises(asyncio.CancelledError):
         await plugin._run_poll_loop()
 
     assert poller.calls == 2
+    assert any("启动检查开始" in message for message in messages)
+    assert any(
+        "下次定时检查将在 30 分钟后执行" in message
+        for message in messages
+    )
+    assert any("定时检查开始" in message for message in messages)
 
 
 @pytest.mark.asyncio
