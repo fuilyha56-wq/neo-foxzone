@@ -20,7 +20,7 @@ class NeoFoxzoneConfig(BaseConfig):
 
         enabled: bool = Field(default=True, description="启用 Neo FoxZone。")
         version: str = Field(
-            default="0.1.0",
+            default="0.1.1",
             description="当前插件版本。",
             disabled=True,
         )

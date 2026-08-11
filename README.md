@@ -1,6 +1,6 @@
 # Neo FoxZone
 
-Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。当前版本为 `0.1.0`。它以
+Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。当前版本为 `0.1.1`。它以
 [OneBot Expand](https://github.com/fuilyha56-wq/onebot_expand) 为硬前置，
 通过 QZone Service 调用 OneBot 协议端，并通过 Account Service 识别当前 Bot QQ；
 插件不读取、保存或刷新 QQ 空间 Cookie，也不依赖 `p_skey`、`skey` 或浏览器私有
@@ -18,7 +18,7 @@ HTTP 接口。
 - 拉黑或解除拉黑空间用户
 - 修改已发布说说的查看权限
 
-在这 9 项协议能力之上，`0.1.0` 还提供：
+在这 9 项协议能力之上，`0.1.1` 还提供：
 
 - 插件启动后立即检查未回复评论，之后默认每 30 分钟轮询一次。
 - 持久记录已处理评论，重启后不会重复回复。
@@ -572,7 +572,7 @@ config/plugins/neo-foxzone/config.toml
 ```toml
 [plugin]
 enabled = true
-version = "0.1.0"
+version = "0.1.1"
 
 [components]
 command_enabled = true
@@ -758,6 +758,24 @@ mpdt plugin build plugins/neo-foxzone
   说说上验证。
 - `OPERATOR` 权限只保护聊天命令；LLM Tool 是否暴露由配置和 Neo-MoFox 的模型工具
   策略共同决定。
+
+## 版本记录
+
+### 0.1.1
+
+- 新增完整的轮询决策日志：启动检查、下次定时检查预计时间、自身说说与好友动态
+  读取结果、每条候选的接受或跳过原因、LLM 生成与协议端发送结果。
+- 查询失败时记录具体协议错误（如 DNS 解析失败、retcode 等），不再只显示数量。
+- 日志中的 QQ 号做掩码，评论与回复只打印单行短预览，减少隐私暴露。
+- 新增仓库根目录标准 AGPL-3.0 `LICENSE`，GitHub 已正确识别许可证。
+- 补充“是否需要配置 HTTP 服务”说明：Neo FoxZone 不需要独立 HTTP 服务。
+
+### 0.1.0
+
+- 首次发布。完整封装 OneBot Expand 的 9 项 QQ 空间说说能力。
+- 支持评论自动回复轮询、持久去重、失败退避和跨重启恢复。
+- 支持可替换 AI 生图发布，等待图片完成后与正文一次发布。
+- 提供 10 个 LLM Tool 和一套 `/neofoxzone` 管理命令。
 
 ## 许可证
 
