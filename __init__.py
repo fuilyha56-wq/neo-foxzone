@@ -3,7 +3,7 @@
 PLUGIN_NAME = "neo-foxzone"
 BACKEND_SERVICE_SIGNATURE = "onebot_expand:service:qzone_service"
 ACCOUNT_SERVICE_SIGNATURE = "onebot_expand:service:account_service"
-SERVICE_NAME = "neo_foxzone_service"
+SERVICE_NAME = "qzone_service"
 SERVICE_SIGNATURE = f"{PLUGIN_NAME}:service:{SERVICE_NAME}"
 
 __all__ = [

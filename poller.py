@@ -16,7 +16,7 @@ from src.kernel.logger import get_logger
 
 from . import ACCOUNT_SERVICE_SIGNATURE
 from .config import NeoFoxzoneConfig
-from .feed_parser import ReplyCandidate, extract_reply_candidates
+from .feed_parser import ReplyCandidate, ReplySource, extract_reply_candidates
 from .polling_state import PollingState
 from .service import NeoFoxzoneService, QzoneResponse
 
@@ -52,7 +52,13 @@ def _declared_comment_count(posts: list[dict[str, Any]]) -> int:
     """汇总协议声明的评论数量。"""
     total = 0
     for post in posts:
-        for key in ("comment_num", "comment_count", "commentCount"):
+        for key in (
+            "comment_num",
+            "comment_count",
+            "commentCount",
+            "commentnum",
+            "cmtnum",
+        ):
             value = post.get(key)
             if value is None:
                 continue
@@ -124,6 +130,14 @@ class PollingQzoneService(Protocol):
         """获取好友动态。"""
         ...
 
+    async def get_qzone_msg_detail(
+        self,
+        tid: str,
+        host_uin: int,
+    ) -> QzoneResponse:
+        """获取单条说说详情及其完整评论树。"""
+        ...
+
     async def comment_qzone(
         self,
         tid: str,
@@ -132,6 +146,20 @@ class PollingQzoneService(Protocol):
         images: list[str] | None = None,
     ) -> QzoneResponse:
         """发表评论。"""
+        ...
+
+    async def reply_qzone_comment(
+        self,
+        *,
+        tid: str,
+        host_uin: int,
+        root_comment_id: str,
+        target_uin: int,
+        target_name: str,
+        content: str,
+        self_uin: int | None = None,
+    ) -> QzoneResponse:
+        """在指定顶层评论下发送楼中楼回复。"""
         ...
 
 
@@ -258,6 +286,163 @@ class QzoneReplyPoller:
         maximum = max(1, int(config.max_reply_chars))
         return reply[:maximum].strip()
 
+    @staticmethod
+    def _post_id(post: dict[str, Any]) -> str:
+        """读取可用于 QZone 详情请求的说说 ID。"""
+        for key in ("tid", "key", "id", "feedskey"):
+            value = post.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _post_owner_uin(post: dict[str, Any]) -> int:
+        """读取说说所有者 QQ，无法确认时返回零。"""
+        for key in ("uin", "user_id", "owner_uin", "ownerUin"):
+            try:
+                value = int(post.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 0
+
+    async def _detail_candidates(
+        self,
+        *,
+        posts: list[dict[str, Any]],
+        source: ReplySource,
+        bot_uin: int,
+        known_bot_comments: dict[str, set[str]],
+        known_bot_comment_roots: dict[str, dict[str, str]],
+        report: PollReport,
+    ) -> tuple[list[ReplyCandidate], int]:
+        """把 SnowLuma 的说说摘要补全为可验证的评论候选。"""
+        get_detail = getattr(self.service, "get_qzone_msg_detail", None)
+        if get_detail is None or not callable(get_detail):
+            return [], 0
+
+        candidates: list[ReplyCandidate] = []
+        attempts = 0
+        source_label = "自身说说" if source == "own_post" else "好友动态"
+        container_key = "msglist" if source == "own_post" else "feeds"
+        for post in posts:
+            post_id = self._post_id(post)
+            if not post_id:
+                continue
+            if source == "own_post":
+                if (
+                    _declared_comment_count([post]) <= 0
+                    and _structured_comment_count([post]) <= 0
+                ):
+                    continue
+                host_uin = bot_uin
+            else:
+                app_id = str(post.get("appid", "")).strip()
+                if app_id and app_id != "311":
+                    continue
+                host_uin = self._post_owner_uin(post)
+                if host_uin <= 0:
+                    continue
+                post_key = PollingState.post_key(post_id, host_uin)
+                if (
+                    _structured_comment_count([post]) <= 0
+                    and not known_bot_comments.get(post_key)
+                ):
+                    continue
+
+            attempts += 1
+            try:
+                detail_response = await get_detail(post_id, host_uin)
+            except Exception as error:
+                report.query_errors.append(
+                    f"{source_label}详情查询异常（{post_id}）: {error}"
+                )
+                logger.warning(
+                    f"{source_label}详情读取异常: 说说ID={post_id}, "
+                    f"决策=跳过该说说，原因={error}。"
+                )
+                continue
+            if not isinstance(detail_response, dict) or not NeoFoxzoneService.response_succeeded(
+                detail_response
+            ):
+                error = (
+                    NeoFoxzoneService.response_error(detail_response)
+                    if isinstance(detail_response, dict)
+                    else "详情接口返回无效响应。"
+                )
+                report.query_errors.append(
+                    f"{source_label}详情查询失败（{post_id}）: {error}"
+                )
+                logger.warning(
+                    f"{source_label}详情读取失败: 说说ID={post_id}, "
+                    f"决策=跳过该说说，原因={error}。"
+                )
+                continue
+            detail = _response_data(detail_response)
+            if not detail:
+                report.query_errors.append(
+                    f"{source_label}详情查询失败（{post_id}）: 响应缺少 data。"
+                )
+                logger.warning(
+                    f"{source_label}详情读取失败: 说说ID={post_id}, "
+                    "决策=跳过该说说，原因=响应缺少 data。"
+                )
+                continue
+            normalized_detail = dict(detail)
+            normalized_detail.setdefault("tid", post_id)
+            normalized_detail.setdefault("uin", host_uin)
+            candidates.extend(
+                extract_reply_candidates(
+                    {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {container_key: [normalized_detail]},
+                    },
+                    bot_uin=bot_uin,
+                    known_bot_comment_ids=known_bot_comments,
+                    known_bot_comment_roots=known_bot_comment_roots,
+                    detail_verified=True,
+                )
+            )
+        return candidates, attempts
+
+    async def _send_thread_reply(
+        self,
+        candidate: ReplyCandidate,
+        reply: str,
+        bot_uin: int,
+    ) -> QzoneResponse:
+        """用详情验证的顶层评论 ID 发送真正的 QZone 楼中楼回复。"""
+        if not candidate.detail_verified:
+            raise RuntimeError(
+                "评论未由 QZone 详情接口验证，已拒绝使用摘要评论 ID 发送回复。"
+            )
+        root_comment_id = str(candidate.root_comment_id or "").strip()
+        if not root_comment_id:
+            raise RuntimeError("评论详情缺少可验证的顶层评论 ID，已拒绝发送。")
+        target_name = candidate.commenter_name.strip()
+        if not target_name:
+            raise RuntimeError("评论详情缺少被回复者昵称，已拒绝发送。")
+        host_uin = candidate.post_owner_uin or bot_uin
+        if candidate.source == "friend_feed" and candidate.post_owner_uin is None:
+            raise RuntimeError("好友说说详情缺少发布者 QQ，已拒绝发送。")
+        reply_method = getattr(self.service, "reply_qzone_comment", None)
+        if reply_method is None or not callable(reply_method):
+            raise RuntimeError(
+                "OneBot Expand QZone Service 缺少 reply_qzone_comment，"
+                "无法安全发送楼中楼回复。"
+            )
+        return await reply_method(
+            tid=candidate.post_id,
+            host_uin=host_uin,
+            root_comment_id=root_comment_id,
+            target_uin=candidate.commenter_uin,
+            target_name=target_name,
+            content=reply,
+            self_uin=bot_uin,
+        )
+
     async def _query_candidates(self, bot_uin: int, report: PollReport) -> list[ReplyCandidate]:
         """独立查询自身说说与好友动态，并合并可回复候选。"""
         config = self._config().polling
@@ -265,6 +450,10 @@ class QzoneReplyPoller:
         known_bot_comments = {
             post_key: set(comment_ids)
             for post_key, comment_ids in self.state.bot_comments_by_post.items()
+        }
+        known_bot_comment_roots = {
+            post_key: dict(comment_roots)
+            for post_key, comment_roots in self.state.bot_comment_roots_by_post.items()
         }
         try:
             own_response = await self.service.get_qzone_msg_list(
@@ -275,11 +464,28 @@ class QzoneReplyPoller:
                 own_posts = _response_items(own_response, "msglist")
                 declared_comments = _declared_comment_count(own_posts)
                 structured_comments = _structured_comment_count(own_posts)
-                own_candidates = extract_reply_candidates(
-                    own_response,
-                    bot_uin=bot_uin,
-                    known_bot_comment_ids=known_bot_comments,
+                has_detail_query = callable(
+                    getattr(self.service, "get_qzone_msg_detail", None)
                 )
+                own_candidates = (
+                    []
+                    if has_detail_query
+                    else extract_reply_candidates(
+                        own_response,
+                        bot_uin=bot_uin,
+                        known_bot_comment_ids=known_bot_comments,
+                        known_bot_comment_roots=known_bot_comment_roots,
+                    )
+                )
+                detail_candidates, detail_attempts = await self._detail_candidates(
+                    posts=own_posts,
+                    source="own_post",
+                    bot_uin=bot_uin,
+                    known_bot_comments=known_bot_comments,
+                    known_bot_comment_roots=known_bot_comment_roots,
+                    report=report,
+                )
+                own_candidates.extend(detail_candidates)
                 candidates.extend(own_candidates)
                 logger.info(
                     "自身说说读取完成: "
@@ -301,7 +507,13 @@ class QzoneReplyPoller:
                         f"结构化评论={post_structured}, "
                         f"正文预览={_preview(post.get('content') or post.get('text'))!r}。"
                     )
-                if declared_comments > 0 and structured_comments == 0:
+                if detail_attempts:
+                    logger.info(
+                        "自身说说详情补全完成: "
+                        f"详情请求={detail_attempts}, "
+                        f"新增可回复候选={len(detail_candidates)}。"
+                    )
+                elif declared_comments > 0 and structured_comments == 0:
                     logger.warning(
                         "自身说说决策: 协议仅返回评论数量，未返回评论 ID、"
                         "作者、正文和父子关系；决策=不回复，避免误回复。"
@@ -334,11 +546,28 @@ class QzoneReplyPoller:
                 feeds = _response_items(feed_response, "feeds")
                 html_feeds = sum(1 for feed in feeds if feed.get("html"))
                 structured_comments = _structured_comment_count(feeds)
-                feed_candidates = extract_reply_candidates(
-                    feed_response,
-                    bot_uin=bot_uin,
-                    known_bot_comment_ids=known_bot_comments,
+                has_detail_query = callable(
+                    getattr(self.service, "get_qzone_msg_detail", None)
                 )
+                feed_candidates = (
+                    []
+                    if has_detail_query
+                    else extract_reply_candidates(
+                        feed_response,
+                        bot_uin=bot_uin,
+                        known_bot_comment_ids=known_bot_comments,
+                        known_bot_comment_roots=known_bot_comment_roots,
+                    )
+                )
+                detail_candidates, detail_attempts = await self._detail_candidates(
+                    posts=feeds,
+                    source="friend_feed",
+                    bot_uin=bot_uin,
+                    known_bot_comments=known_bot_comments,
+                    known_bot_comment_roots=known_bot_comment_roots,
+                    report=report,
+                )
+                feed_candidates.extend(detail_candidates)
                 candidates.extend(feed_candidates)
                 logger.info(
                     "好友动态读取完成: "
@@ -346,7 +575,13 @@ class QzoneReplyPoller:
                     f"结构化评论={structured_comments}, "
                     f"可回复候选={len(feed_candidates)}。"
                 )
-                if html_feeds > 0 and structured_comments == 0:
+                if detail_attempts:
+                    logger.info(
+                        "好友动态详情补全完成: "
+                        f"详情请求={detail_attempts}, "
+                        f"新增可回复候选={len(detail_candidates)}。"
+                    )
+                elif html_feeds > 0 and structured_comments == 0:
                     logger.warning(
                         "好友动态决策: 协议返回预渲染 HTML，缺少可验证的评论 ID、"
                         "作者和父子关系；决策=不回复，避免从页面文本猜测。"
@@ -536,11 +771,10 @@ class QzoneReplyPoller:
 
                 try:
                     logger.info(f"自动回复发送开始: {label}。")
-                    response = await self.service.comment_qzone(
-                        tid=candidate.post_id,
-                        content=reply,
-                        target_uin=candidate.target_uin,
-                        images=None,
+                    response = await self._send_thread_reply(
+                        candidate,
+                        reply,
+                        bot_uin,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -573,6 +807,7 @@ class QzoneReplyPoller:
                         post_id=candidate.post_id,
                         owner_uin=candidate.target_uin,
                         comment_id=comment_id,
+                        root_comment_id=candidate.root_comment_id,
                     )
                 report.replied += 1
                 logger.info(

@@ -60,6 +60,35 @@ class FakeQzoneBackend:
         """模拟获取好友动态。"""
         return self._response("get_qzone_feeds", page_num=page_num, count=count)
 
+    async def get_qzone_user_feeds(
+        self,
+        *,
+        host_uin: int,
+        pos: int = 0,
+        num: int = 5,
+        self_uin: int | None = None,
+    ) -> dict[str, Any]:
+        """模拟读取指定 QQ 的说说列表。"""
+        return self._response(
+            "get_qzone_user_feeds",
+            host_uin=host_uin,
+            pos=pos,
+            num=num,
+            self_uin=self_uin,
+        )
+
+    async def get_qzone_msg_detail(
+        self,
+        tid: str,
+        host_uin: int,
+    ) -> dict[str, Any]:
+        """模拟获取说说详情。"""
+        return self._response(
+            "get_qzone_msg_detail",
+            tid=tid,
+            host_uin=host_uin,
+        )
+
     async def send_qzone_msg(
         self,
         content: str,
@@ -110,6 +139,29 @@ class FakeQzoneBackend:
             content=content,
             target_uin=target_uin,
             images=images,
+        )
+
+    async def reply_qzone_comment(
+        self,
+        *,
+        tid: str,
+        host_uin: int,
+        root_comment_id: str,
+        target_uin: int,
+        target_name: str,
+        content: str,
+        self_uin: int | None = None,
+    ) -> dict[str, Any]:
+        """模拟发送楼中楼回复。"""
+        return self._response(
+            "reply_qzone_comment",
+            tid=tid,
+            host_uin=host_uin,
+            root_comment_id=root_comment_id,
+            target_uin=target_uin,
+            target_name=target_name,
+            content=content,
+            self_uin=self_uin,
         )
 
     async def set_qzone_ban(
@@ -208,6 +260,167 @@ async def test_service_forwards_all_nine_qzone_actions(
 
 
 @pytest.mark.asyncio
+async def test_service_forwards_detail_and_thread_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """详情和楼中楼内部能力应经校验后完整转发至 OneBot Expand。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    await service.get_qzone_msg_detail(tid=" detail-tid ", host_uin=10001)
+    await service.reply_qzone_comment(
+        tid=" reply-tid ",
+        host_uin=10002,
+        root_comment_id=" global-root-comment-id ",
+        target_uin=10003,
+        target_name=" 被回复者 ",
+        content=" 楼中楼回复 ",
+        self_uin=10004,
+    )
+
+    assert backend.calls == [
+        (
+            "get_qzone_msg_detail",
+            {"tid": "detail-tid", "host_uin": 10001},
+        ),
+        (
+            "reply_qzone_comment",
+            {
+                "tid": "reply-tid",
+                "host_uin": 10002,
+                "root_comment_id": "global-root-comment-id",
+                "target_uin": 10003,
+                "target_name": "被回复者",
+                "content": "楼中楼回复",
+                "self_uin": 10004,
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_service_facade_filters_reads_and_uses_shared_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """原版 Service 门面应返回规范列表并复用插件级互动状态。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    async def get_user_feeds(**kwargs: Any) -> dict[str, Any]:
+        """返回一条已评论和一条待互动的说说。"""
+        return {
+            "status": "ok",
+            "retcode": 0,
+            "data": {
+                "msglist": [
+                    {"tid": "already-commented", "commentlist": []},
+                    {
+                        "tid": "feed-new",
+                        "content": "新动态",
+                        "commentlist": [
+                            {
+                                "comment_id": "root-comment",
+                                "uin": 20002,
+                                "nickname": "访客",
+                                "content": "一级评论",
+                                "list_3": [
+                                    {
+                                        "comment_id": "child-comment",
+                                        "uin": 20003,
+                                        "nickname": "回复者",
+                                        "content": "楼中楼评论",
+                                        "list_3": [],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ]
+            },
+        }
+
+    async def comment_qzone(**kwargs: Any) -> dict[str, Any]:
+        """记录原版门面的写入参数。"""
+        return backend._response("comment_qzone", **kwargs)
+
+    async def get_qzone_msg_detail(
+        tid: str,
+        host_uin: int,
+    ) -> dict[str, Any]:
+        """返回用于详情门面断言的完整评论树。"""
+        return {
+            "status": "ok",
+            "retcode": 0,
+            "data": {
+                "tid": tid,
+                "uin": host_uin,
+                "commentlist": [
+                    {
+                        "comment_id": "root-comment",
+                        "uin": 20002,
+                        "nickname": "访客",
+                        "content": "一级评论",
+                        "list_3": [
+                            {
+                                "comment_id": "child-comment",
+                                "uin": 20003,
+                                "nickname": "回复者",
+                                "content": "楼中楼评论",
+                                "list_3": [],
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+    backend.get_qzone_user_feeds = get_user_feeds  # type: ignore[method-assign]
+    backend.comment_qzone = comment_qzone  # type: ignore[method-assign]
+    backend.get_qzone_msg_detail = get_qzone_msg_detail  # type: ignore[method-assign]
+    service.plugin.runtime.interaction_log.mark(
+        "20001",
+        "already-commented",
+        "commented",
+        "agent",
+    )
+
+    feeds = await service.list_feeds(
+        target_qq="20001",
+        num=2,
+        skip_commented=True,
+    )
+    detail = await service.get_feed_detail("20001", "feed-new")
+    commented = await service.comment("20001", "feed-new", "原版评论")
+
+    assert [feed["tid"] for feed in feeds] == ["feed-new"]
+    assert detail is not None
+    assert detail["comments"] == [
+        {
+            "comment_tid": "root-comment",
+            "parent_tid": "",
+            "qq_account": "20002",
+            "nickname": "访客",
+            "content": "一级评论",
+        },
+        {
+            "comment_tid": "child-comment",
+            "parent_tid": "root-comment",
+            "qq_account": "20003",
+            "nickname": "回复者",
+            "content": "楼中楼评论",
+        },
+    ]
+    assert commented is True
+    assert backend.calls[-1] == (
+        "comment_qzone",
+        {
+            "tid": "feed-new",
+            "content": "原版评论",
+            "target_uin": 20001,
+            "images": None,
+        },
+    )
+
+
+@pytest.mark.asyncio
 async def test_service_rejects_invalid_inputs_before_backend_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -280,15 +493,16 @@ async def test_tools_and_command_use_plugin_service(
 
 
 def test_plugin_registers_service_command_and_ten_tools() -> None:
-    """默认配置应注册基础能力和 AI 生图发布入口。"""
+    """默认配置应注册基础能力、AI 生图发布入口和原版 Tool 名。"""
     plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
     names = [component.name for component in plugin.get_components()]
 
     assert names == [
-        "neo_foxzone_service",
-        "neofoxzone",
+        "qzone_service",
+        "neo-foxzone",
         "neo_foxzone_list_posts",
         "neo_foxzone_list_feeds",
+        "qzone_read_feed",
         "neo_foxzone_publish",
         "neo_foxzone_publish_generated",
         "neo_foxzone_delete",
@@ -297,15 +511,17 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         "neo_foxzone_comment",
         "neo_foxzone_set_blacklist",
         "neo_foxzone_set_visibility",
+        "qzone_post_comment",
+        "qzone_like_feed",
     ]
     assert all(
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.1"
+    assert plugin.plugin_version == "0.1.3"
     assert plugin.dependencies == [BACKEND_SIGNATURE, ACCOUNT_SIGNATURE]
-    assert plugin.config.plugin.version == "0.1.1"
-    assert NeoFoxzoneService.version == "0.1.1"
+    assert plugin.config.plugin.version == "0.1.3"
+    assert NeoFoxzoneService.version == "0.1.3"
 
 
 def test_manifest_declares_market_and_runtime_dependency() -> None:
@@ -314,9 +530,9 @@ def test_manifest_declares_market_and_runtime_dependency() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.1"
+    assert manifest["version"] == "0.1.3"
     assert manifest["dependencies"]["plugins"] == [
-        "onebot_expand>=1.0.13"
+        "onebot_expand>=1.0.17"
     ]
     assert manifest["dependencies"]["components"] == [
         BACKEND_SIGNATURE,
@@ -582,8 +798,8 @@ def test_feed_parser_selects_only_unanswered_recoverable_comments() -> None:
     assert candidates[1].target_uin == 20001
 
 
-def test_feed_parser_recovers_reply_to_persisted_bot_comment() -> None:
-    """父评论未展开时，持久化的 Bot 评论 ID 仍应恢复直接回复。"""
+def test_feed_parser_recovers_thread_root_for_persisted_bot_comment() -> None:
+    """父评论未展开时，应从持久化映射恢复真实顶层评论 ID。"""
     parser_module = importlib.import_module(f"{PACKAGE}.feed_parser")
     candidates = parser_module.extract_reply_candidates(
         {
@@ -610,11 +826,17 @@ def test_feed_parser_recovers_reply_to_persisted_bot_comment() -> None:
         known_bot_comment_ids={
             "20001:friend-post": {"persisted-bot-comment"}
         },
+        known_bot_comment_roots={
+            "20001:friend-post": {
+                "persisted-bot-comment": "global-root-comment-id"
+            }
+        },
     )
 
     assert [(item.post_id, item.comment_id) for item in candidates] == [
         ("friend-post", "friend-reply")
     ]
+    assert candidates[0].root_comment_id == "global-root-comment-id"
 
 
 def test_feed_parser_rejects_ambiguous_comment_fields() -> None:
@@ -831,6 +1053,81 @@ async def test_polling_state_persists_and_trims_deduplication_records(
 
 
 @pytest.mark.asyncio
+async def test_runtime_preserves_original_plugin_state_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """插件级运行时应共享并保留原版 FoxZone 的持久化 JSON 形状。"""
+    runtime_module = importlib.import_module(f"{PACKAGE}.runtime")
+    stored: dict[tuple[str, str], dict[str, Any]] = {
+        ("neo-foxzone", "reply_tracker"): {
+            "data": {"feed-1": {"comment-1": 1234.5}}
+        },
+        ("neo-foxzone", "interaction_log"): {
+            "log": {"20001:feed-1": {"liked": True, "source": "poll"}}
+        },
+        ("neo-foxzone", "vision_cache"): {
+            "cache": {"https://example.test/old.png": "旧图片描述"}
+        },
+        ("neo-foxzone", "send_history"): {
+            "records": [{"time": "2025-01-01 00:00:00", "text": "旧说说"}]
+        },
+        ("neo-foxzone", "polling_state"): {
+            "processed_comment_ids": ["existing-comment"]
+        },
+    }
+
+    async def load_json(
+        store_name: str,
+        name: str,
+    ) -> dict[str, Any] | None:
+        """返回内存中的隔离状态副本。"""
+        payload = stored.get((store_name, name))
+        return json.loads(json.dumps(payload)) if payload is not None else None
+
+    async def save_json(
+        store_name: str,
+        name: str,
+        data: dict[str, Any],
+    ) -> None:
+        """记录运行时写回的兼容状态。"""
+        stored[(store_name, name)] = json.loads(json.dumps(data))
+
+    monkeypatch.setattr(runtime_module.storage_api, "load_json", load_json)
+    monkeypatch.setattr(runtime_module.storage_api, "save_json", save_json)
+
+    runtime = runtime_module.NeoFoxzoneRuntime(polling_state_max_entries=8)
+    await runtime.initialize()
+
+    assert runtime.initialized is True
+    assert runtime.reply_tracker.has_replied("feed-1", "comment-1") is True
+    assert runtime.interaction_log.has_liked("20001", "feed-1") is True
+    assert runtime.vision_cache.get("https://example.test/old.png") == "旧图片描述"
+    assert runtime.polling_state.is_processed("existing-comment") is True
+
+    await runtime.reply_tracker.mark_as_replied("feed-2", "comment-2")
+    runtime.interaction_log.mark("20002", "feed-2", "commented", "agent")
+    runtime.vision_cache.set("https://example.test/new.png", "新图片描述")
+    await runtime.send_history.record("新说说")
+    await runtime.shutdown()
+
+    assert stored[("neo-foxzone", "reply_tracker")]["data"]["feed-2"] == {
+        "comment-2": pytest.approx(
+            stored[("neo-foxzone", "reply_tracker")]["data"]["feed-2"]["comment-2"]
+        )
+    }
+    assert stored[("neo-foxzone", "interaction_log")]["log"]["20002:feed-2"][
+        "commented"
+    ] is True
+    assert stored[("neo-foxzone", "vision_cache")]["cache"][
+        "https://example.test/new.png"
+    ] == "新图片描述"
+    assert [record["text"] for record in stored[("neo-foxzone", "send_history")]["records"]] == [
+        "旧说说",
+        "新说说",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_poller_replies_only_to_new_candidates_and_commits_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -891,6 +1188,7 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
                                 {
                                     "commentid": "old-comment",
                                     "uin": 10001,
+                                    "nickname": "旧访客",
                                     "content": "旧评论",
                                 },
                                 {
@@ -916,24 +1214,42 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
                 "data": {"feeds": []},
             }
 
-        async def comment_qzone(
+        async def get_qzone_msg_detail(
             self,
             tid: str,
-            content: str,
-            target_uin: int | None = None,
-            images: list[str] | None = None,
+            host_uin: int,
         ) -> dict[str, Any]:
-            assert snapshots[-1]["in_flight_comment_ids"] == [
-                "own_post:0:own-post:new-comment"
-            ]
-            self.comments.append(
-                {
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
                     "tid": tid,
-                    "content": content,
-                    "target_uin": target_uin,
-                    "images": images,
-                }
-            )
+                    "uin": host_uin,
+                    "content": "测试说说",
+                    "commentlist": [
+                        {
+                            "comment_id": "old-comment",
+                            "uin": 10001,
+                            "nickname": "旧访客",
+                            "content": "旧评论",
+                            "list_3": [],
+                        },
+                        {
+                            "comment_id": "new-comment",
+                            "uin": 10002,
+                            "nickname": "新访客",
+                            "content": "新评论",
+                            "list_3": [],
+                        },
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
+            assert snapshots[-1]["in_flight_comment_ids"] == [
+                "own_post:99999:own-post:new-comment"
+            ]
+            self.comments.append(kwargs)
             return {
                 "status": "ok",
                 "retcode": 0,
@@ -954,7 +1270,7 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
     config = NeoFoxzoneConfig()
     plugin = NeoFoxzonePlugin(config=config)
     state = PollingState(max_entries=20)
-    state.mark_processed("own_post:0:own-post:old-comment")
+    state.mark_processed("own_post:99999:own-post:old-comment")
     service = FakePollingService()
     poller = QzoneReplyPoller(
         plugin,
@@ -970,16 +1286,19 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
     assert service.comments == [
         {
             "tid": "own-post",
+            "host_uin": 99999,
+            "root_comment_id": "new-comment",
+            "target_uin": 10002,
+            "target_name": "新访客",
             "content": "回复 新评论",
-            "target_uin": None,
-            "images": None,
+            "self_uin": 99999,
         }
     ]
     assert report.candidates == 2
     assert report.skipped_processed == 1
     assert report.replied == 1
     assert report.failed == 0
-    assert state.is_processed("own_post:0:own-post:new-comment") is True
+    assert state.is_processed("own_post:99999:own-post:new-comment") is True
     assert state.known_bot_comment_ids("own-post", None) == {
         "bot-comment-new"
     }
@@ -1098,6 +1417,113 @@ async def test_poller_logs_query_shape_and_safe_skip_decision(
 
 
 @pytest.mark.asyncio
+async def test_poller_enriches_snowluma_summaries_before_thread_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """摘要列表必须先补全详情，再用顶层全局评论 ID 发送楼中楼回复。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    detail_calls: list[tuple[str, int]] = []
+    reply_calls: list[dict[str, Any]] = []
+    plain_comment_calls: list[dict[str, Any]] = []
+
+    async def save_json(*args: Any, **kwargs: Any) -> None:
+        """避免测试写入实际插件状态。"""
+
+    monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+
+    class SnowLumaSummaryService:
+        """模拟只提供说说摘要、但支持详情兼容接口的 SnowLuma。"""
+
+        async def get_qzone_msg_list(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "msglist": [
+                        {
+                            "tid": "own-post",
+                            "content": "SnowLuma 摘要正文",
+                            "comment_num": 1,
+                        }
+                    ]
+                },
+            }
+
+        async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
+
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            detail_calls.append((tid, host_uin))
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "content": "完整说说正文",
+                    "commentlist": [
+                        {
+                            "comment_id": "global-root-comment-id",
+                            "uin": 10001,
+                            "nickname": "访客",
+                            "content": "请回复我",
+                            "list_3": [],
+                        }
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
+            reply_calls.append(kwargs)
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"commentid": "bot-thread-reply-id"},
+            }
+
+        async def comment_qzone(self, **kwargs: Any) -> dict[str, Any]:
+            plain_comment_calls.append(kwargs)
+            raise AssertionError("详情路径可用时不得退回普通评论")
+
+    async def generate_reply(candidate: Any) -> str:
+        """返回固定回复，便于断言远端参数。"""
+        assert candidate.comment_id == "global-root-comment-id"
+        return "收到啦"
+
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=NeoFoxzoneConfig()),
+        service=SnowLumaSummaryService(),
+        state=state_module.PollingState(),
+        reply_generator=generate_reply,
+        bot_uin_loader=lambda: asyncio.sleep(0, result=99999),
+    )
+
+    report = await poller.poll_once()
+
+    assert detail_calls == [("own-post", 99999)]
+    assert plain_comment_calls == []
+    assert reply_calls == [
+        {
+            "tid": "own-post",
+            "host_uin": 99999,
+            "root_comment_id": "global-root-comment-id",
+            "target_uin": 10001,
+            "target_name": "访客",
+            "content": "收到啦",
+            "self_uin": 99999,
+        }
+    ]
+    assert report.candidates == 1
+    assert report.replied == 1
+    assert report.failed == 0
+
+
+@pytest.mark.asyncio
 async def test_poller_does_not_send_when_reservation_cannot_be_persisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1195,6 +1621,7 @@ async def test_poller_keeps_ambiguous_remote_result_in_flight(
                                 {
                                     "commentid": "uncertain-comment",
                                     "uin": 10001,
+                                    "nickname": "访客",
                                     "content": "网络结果不明",
                                 }
                             ],
@@ -1206,7 +1633,30 @@ async def test_poller_keeps_ambiguous_remote_result_in_flight(
         async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
             return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
 
-        async def comment_qzone(self, **kwargs: Any) -> dict[str, Any]:
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "commentlist": [
+                        {
+                            "comment_id": "uncertain-comment",
+                            "uin": 10001,
+                            "nickname": "访客",
+                            "content": "网络结果不明",
+                            "list_3": [],
+                        }
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
             nonlocal sends
             sends += 1
             raise TimeoutError("response lost")
@@ -1226,7 +1676,7 @@ async def test_poller_keeps_ambiguous_remote_result_in_flight(
     first = await poller.poll_once()
     second = await poller.poll_once()
 
-    identity = "own_post:0:own-post:uncertain-comment"
+    identity = "own_post:99999:own-post:uncertain-comment"
     assert sends == 1
     assert first.failed == 1
     assert second.skipped_in_flight == 1
@@ -1262,11 +1712,13 @@ async def test_poller_rotates_after_failed_candidate(
                                 {
                                     "commentid": "always-fails",
                                     "uin": 10001,
+                                    "nickname": "第一位访客",
                                     "content": "第一条",
                                 },
                                 {
                                     "commentid": "should-run-next",
                                     "uin": 10002,
+                                    "nickname": "第二位访客",
                                     "content": "第二条",
                                 },
                             ],
@@ -1278,7 +1730,37 @@ async def test_poller_rotates_after_failed_candidate(
         async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
             return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
 
-        async def comment_qzone(self, **kwargs: Any) -> dict[str, Any]:
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "commentlist": [
+                        {
+                            "comment_id": "always-fails",
+                            "uin": 10001,
+                            "nickname": "第一位访客",
+                            "content": "第一条",
+                            "list_3": [],
+                        },
+                        {
+                            "comment_id": "should-run-next",
+                            "uin": 10002,
+                            "nickname": "第二位访客",
+                            "content": "第二条",
+                            "list_3": [],
+                        },
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
             sent.append(str(kwargs["content"]))
             return {"status": "ok", "retcode": 0}
 
@@ -1559,4 +2041,31 @@ async def test_generated_publish_tool_and_commands_use_existing_runtime(
     assert [call[0] for call in backend.calls] == [
         "send_qzone_msg",
         "send_qzone_msg",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_forwards_internal_user_feed_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """任意 QQ 读取应经内部无浏览器 QZone Service 完整转发参数。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    await service.get_qzone_user_feeds(
+        host_uin=20001,
+        pos=2,
+        num=3,
+        self_uin=10001,
+    )
+
+    assert backend.calls == [
+        (
+            "get_qzone_user_feeds",
+            {
+                "host_uin": 20001,
+                "pos": 2,
+                "num": 3,
+                "self_uin": 10001,
+            },
+        )
     ]

@@ -9,7 +9,7 @@ from src.app.plugin_system.api import storage_api
 
 STORE_NAME = "neo-foxzone"
 STATE_NAME = "polling_state"
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def _string_list(value: Any) -> list[str]:
@@ -56,6 +56,19 @@ def _string_int_map(value: Any) -> dict[str, int]:
     return result
 
 
+def _string_map(value: Any) -> dict[str, str]:
+    """把未知 JSON 值收敛为非空字符串映射。"""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip()
+        normalized = str(raw_value).strip()
+        if key and normalized:
+            result[key] = normalized
+    return result
+
+
 @dataclass(slots=True)
 class PollingState:
     """保存已处理评论与 Bot 自己发出的评论引用。"""
@@ -64,6 +77,7 @@ class PollingState:
     processed_comment_ids: list[str] = field(default_factory=list)
     in_flight_comment_ids: list[str] = field(default_factory=list)
     bot_comments_by_post: dict[str, list[str]] = field(default_factory=dict)
+    bot_comment_roots_by_post: dict[str, dict[str, str]] = field(default_factory=dict)
     retry_after_by_identity: dict[str, float] = field(default_factory=dict)
     failure_counts_by_identity: dict[str, int] = field(default_factory=dict)
     last_attempted_identity: str = ""
@@ -86,6 +100,13 @@ class PollingState:
             state.bot_comments_by_post = {
                 str(post_key): _string_list(comment_ids)
                 for post_key, comment_ids in raw_comments.items()
+                if str(post_key).strip()
+            }
+        raw_roots = payload.get("bot_comment_roots_by_post")
+        if isinstance(raw_roots, dict):
+            state.bot_comment_roots_by_post = {
+                str(post_key): _string_map(comment_roots)
+                for post_key, comment_roots in raw_roots.items()
                 if str(post_key).strip()
             }
         state.retry_after_by_identity = _string_float_map(
@@ -172,8 +193,9 @@ class PollingState:
         post_id: str,
         owner_uin: int | None,
         comment_id: str,
+        root_comment_id: str | None = None,
     ) -> None:
-        """记录 Bot 在一条说说下成功发出的评论 ID。"""
+        """记录 Bot 评论及其可用于后续楼中楼回复的顶层评论 ID。"""
         normalized_comment_id = str(comment_id).strip()
         if not normalized_comment_id:
             return
@@ -182,6 +204,10 @@ class PollingState:
         if normalized_comment_id in comments:
             comments.remove(normalized_comment_id)
         comments.append(normalized_comment_id)
+        normalized_root_comment_id = str(root_comment_id or "").strip()
+        if normalized_root_comment_id:
+            roots = self.bot_comment_roots_by_post.setdefault(key, {})
+            roots[normalized_comment_id] = normalized_root_comment_id
         self._trim()
 
     def known_bot_comment_ids(
@@ -192,6 +218,22 @@ class PollingState:
         """返回指定说说下 Neo FoxZone 已发出的评论 ID。"""
         key = self.post_key(post_id, owner_uin)
         return set(self.bot_comments_by_post.get(key, []))
+
+    def known_bot_comment_roots(
+        self,
+        post_id: str,
+        owner_uin: int | None,
+    ) -> dict[str, str]:
+        """返回 Bot 评论 ID 到已验证顶层评论 ID 的映射。"""
+        key = self.post_key(post_id, owner_uin)
+        known_ids = set(self.bot_comments_by_post.get(key, []))
+        return {
+            comment_id: root_comment_id
+            for comment_id, root_comment_id in self.bot_comment_roots_by_post.get(
+                key, {}
+            ).items()
+            if comment_id in known_ids and root_comment_id
+        }
 
     def _trim(self) -> None:
         """限制持久记录数量，优先保留最近项目。"""
@@ -214,20 +256,34 @@ class PollingState:
             for post_key, comment_ids in self.bot_comments_by_post.items()
             for comment_id in comment_ids
         ]
-        if len(flattened) <= maximum:
-            return
-        keep = set(flattened[-maximum:])
-        self.bot_comments_by_post = {
-            post_key: [
-                comment_id
-                for comment_id in comment_ids
-                if (post_key, comment_id) in keep
-            ]
-            for post_key, comment_ids in self.bot_comments_by_post.items()
+        if len(flattened) > maximum:
+            keep = set(flattened[-maximum:])
+            self.bot_comments_by_post = {
+                post_key: [
+                    comment_id
+                    for comment_id in comment_ids
+                    if (post_key, comment_id) in keep
+                ]
+                for post_key, comment_ids in self.bot_comments_by_post.items()
+            }
+            self.bot_comments_by_post = {
+                key: values
+                for key, values in self.bot_comments_by_post.items()
+                if values
+            }
+        self.bot_comment_roots_by_post = {
+            post_key: {
+                comment_id: root_comment_id
+                for comment_id, root_comment_id in comment_roots.items()
+                if comment_id in self.bot_comments_by_post.get(post_key, [])
+                and root_comment_id
+            }
+            for post_key, comment_roots in self.bot_comment_roots_by_post.items()
+            if post_key in self.bot_comments_by_post
         }
-        self.bot_comments_by_post = {
+        self.bot_comment_roots_by_post = {
             key: values
-            for key, values in self.bot_comments_by_post.items()
+            for key, values in self.bot_comment_roots_by_post.items()
             if values
         }
 
@@ -244,6 +300,10 @@ class PollingState:
                 "bot_comments_by_post": {
                     key: list(values)
                     for key, values in self.bot_comments_by_post.items()
+                },
+                "bot_comment_roots_by_post": {
+                    key: dict(values)
+                    for key, values in self.bot_comment_roots_by_post.items()
                 },
                 "retry_after_by_identity": dict(self.retry_after_by_identity),
                 "failure_counts_by_identity": dict(

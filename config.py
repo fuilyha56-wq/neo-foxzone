@@ -20,7 +20,7 @@ class NeoFoxzoneConfig(BaseConfig):
 
         enabled: bool = Field(default=True, description="启用 Neo FoxZone。")
         version: str = Field(
-            default="0.1.1",
+            default="0.1.3",
             description="当前插件版本。",
             disabled=True,
         )
@@ -33,7 +33,7 @@ class NeoFoxzoneConfig(BaseConfig):
 
         command_enabled: bool = Field(
             default=True,
-            description="注册 /neofoxzone 管理命令。",
+            description="注册 /neo-foxzone 管理命令。",
         )
         read_tools_enabled: bool = Field(
             default=True,
@@ -130,6 +130,44 @@ class NeoFoxzoneConfig(BaseConfig):
         )
 
     polling: PollingSection = Field(default_factory=PollingSection)
+
+    @config_section("general", title="自治总控", tag="ai")
+    class GeneralSection(SectionBase):
+        """原版 FoxZone 自治任务总开关与运行节奏。"""
+
+        enabled: bool = Field(default=False, description="启用 FoxZone 自治任务。")
+        interval_minutes: float = Field(
+            default=30.0,
+            description="自治任务之间的最小检查间隔（分钟）。",
+        )
+        startup_check: bool = Field(
+            default=False,
+            description="插件加载后是否立即执行自治任务。",
+        )
+        dnd_start: int = Field(default=0, description="免打扰开始小时（0-23）。")
+        dnd_end: int = Field(default=0, description="免打扰结束小时（0-23）。")
+
+    general: GeneralSection = Field(default_factory=GeneralSection)
+
+    @config_section("llm", title="自治模型", tag="ai")
+    class LlmSection(SectionBase):
+        """自治任务使用的模型和输出边界。"""
+
+        model_task: str = Field(default="utils_small", description="自治模型任务名。")
+        max_reply_chars: int = Field(default=180, description="自治回复最大字符数。")
+
+    llm: LlmSection = Field(default_factory=LlmSection)
+
+    @config_section("monitor", title="自治监控", tag="ai")
+    class MonitorSection(SectionBase):
+        """好友动态与外部评论回查边界。"""
+
+        enabled: bool = Field(default=True, description="启用好友动态互动。")
+        feed_count: int = Field(default=10, description="每轮读取的好友动态数量。")
+        followup_count: int = Field(default=10, description="每轮外部评论回查数量。")
+        max_external_replies: int = Field(default=3, description="单条动态最多接力次数。")
+
+    monitor: MonitorSection = Field(default_factory=MonitorSection)
 
     @config_section("limits", title="调用限制", tag="performance")
     class LimitsSection(SectionBase):

@@ -18,8 +18,10 @@ from . import (
 )
 from .commands import NeoFoxzoneCommand
 from .config import NeoFoxzoneConfig
+from .autopilot.engine import AutonomousEngine, AutonomousScheduler
 from .poller import PollReport, QzoneReplyPoller, create_poller
-from .polling_state import PollingState
+from .polling_state import PollingState  # noqa: F401  兼容旧测试注入点
+from .runtime import NeoFoxzoneRuntime
 from .service import NeoFoxzoneService
 from .tools import READ_TOOLS, WRITE_TOOLS
 
@@ -39,16 +41,22 @@ class NeoFoxzonePlugin(BasePlugin):
 
     plugin_name = "neo-foxzone"
     plugin_description = "基于 OneBot Expand 的 QQ 空间说说全功能插件"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.3"
     configs = [NeoFoxzoneConfig]
     dependencies = [BACKEND_SERVICE_SIGNATURE, ACCOUNT_SERVICE_SIGNATURE]
 
     def __init__(self, config: NeoFoxzoneConfig | None = None) -> None:
-        """初始化轮询任务引用。"""
+        """初始化共享运行时和轮询任务引用。"""
         super().__init__(config)
+        state_max_entries = max(1, int(self._config().polling.state_max_entries))
+        self.runtime = NeoFoxzoneRuntime(
+            polling_state_max_entries=state_max_entries
+        )
         self._poller: QzoneReplyPoller | None = None
         self._poll_task_id: str | None = None
         self._poll_task: asyncio.Task[Any] | None = None
+        self._autonomous_task_ids: list[str] = []
+        self._autonomous_tasks: list[asyncio.Task[Any]] = []
 
     def _config(self) -> NeoFoxzoneConfig:
         """返回当前配置，异常装配时使用默认配置。"""
@@ -139,51 +147,100 @@ class NeoFoxzonePlugin(BasePlugin):
     async def on_plugin_loaded(self) -> None:
         """加载持久状态并注册自动回复守护任务。"""
         config = self._config()
-        if not config.plugin.enabled or not config.polling.enabled:
+        if not config.plugin.enabled:
             logger.info(
-                "Neo FoxZone 自动回复轮询未启动: "
-                f"plugin.enabled={config.plugin.enabled}, "
-                f"polling.enabled={config.polling.enabled}。"
+                "Neo FoxZone 运行时未启动: "
+                f"plugin.enabled={config.plugin.enabled}。"
+            )
+            return
+        try:
+            await self.runtime.initialize()
+        except Exception as error:
+            logger.error(
+                f"Neo FoxZone 共享状态加载失败，已停止启动: {error}",
+                exc_info=error,
             )
             return
         raw_service = service_api.get_service(SERVICE_SIGNATURE)
         if raw_service is None:
-            logger.warning("Neo FoxZone Service 未注册，跳过自动回复轮询。")
+            logger.warning("Neo FoxZone Service 未注册，跳过后台任务启动。")
             return
-        try:
-            state = await PollingState.load(
-                max_entries=max(1, int(config.polling.state_max_entries))
+        if config.polling.enabled:
+            self._poller = create_poller(
+                self,
+                cast(NeoFoxzoneService, raw_service),
+                self.runtime.polling_state,
             )
-        except Exception as error:
-            logger.error(
-                f"Neo FoxZone 轮询状态加载失败，已停止自动回复: {error}",
-                exc_info=error,
+            task = get_task_manager().create_task(
+                self._run_poll_loop(),
+                name="neo_foxzone_reply_poller",
+                daemon=True,
             )
-            return
-        self._poller = create_poller(
-            self,
-            cast(NeoFoxzoneService, raw_service),
-            state,
-        )
-        task = get_task_manager().create_task(
-            self._run_poll_loop(),
-            name="neo_foxzone_reply_poller",
-            daemon=True,
-        )
-        self._poll_task_id = task.task_id
-        self._poll_task = task.task
-        logger.info(
-            "Neo FoxZone 自动回复轮询已启动: "
-            f"启动检查={config.polling.startup_check}, "
-            f"间隔={config.polling.interval_minutes:g} 分钟, "
-            f"自身说说={config.polling.own_posts_count} 条, "
-            f"好友动态={config.polling.friend_feeds_count} 条, "
-            f"单轮最多回复={config.polling.max_replies_per_poll} 条, "
-            f"任务ID={task.task_id}。"
-        )
+            self._poll_task_id = task.task_id
+            self._poll_task = task.task
+            logger.info(
+                "Neo FoxZone 自动回复轮询已启动: "
+                f"启动检查={config.polling.startup_check}, "
+                f"间隔={config.polling.interval_minutes:g} 分钟, "
+                f"自身说说={config.polling.own_posts_count} 条, "
+                f"好友动态={config.polling.friend_feeds_count} 条, "
+                f"单轮最多回复={config.polling.max_replies_per_poll} 条, "
+                f"任务ID={task.task_id}。"
+            )
+        else:
+            logger.info("Neo FoxZone 自动回复轮询已按配置禁用。")
+        if config.general.enabled:
+            scheduler = AutonomousScheduler(
+                AutonomousEngine(
+                    cast(NeoFoxzoneService, raw_service),
+                    self.runtime,
+                    config,
+                ),
+                config,
+            )
+            operations = (
+                (scheduler.engine.run_self_comments, "self_comments"),
+                (scheduler.engine.run_external_followups, "external_followups"),
+                (scheduler.engine.run_friend_monitor, "friend_monitor"),
+            )
+            if config.general.startup_check:
+                for operation, name in operations:
+                    try:
+                        await operation()
+                    except Exception as error:
+                        logger.warning(f"FoxZone 自治启动任务 {name} 异常: {error}")
+            for operation, name in operations:
+                autonomous_task = get_task_manager().create_task(
+                    scheduler.run_loop(operation, name),
+                    name=f"neo_foxzone_{name}",
+                    daemon=True,
+                )
+                self._autonomous_task_ids.append(autonomous_task.task_id)
+                if autonomous_task.task is not None:
+                    self._autonomous_tasks.append(autonomous_task.task)
+            logger.info(
+                "FoxZone 三条自治任务已启动: "
+                f"任务数={len(self._autonomous_task_ids)}。"
+            )
+        else:
+            logger.info("FoxZone 自治任务已按配置禁用。")
 
     async def on_plugin_unloaded(self) -> None:
         """取消自动回复守护任务并清理运行时引用。"""
+        for task_id in self._autonomous_task_ids:
+            get_task_manager().cancel_task(task_id)
+        for task in self._autonomous_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                logger.error(
+                    f"FoxZone 自治任务退出异常: {error}",
+                    exc_info=error,
+                )
+        self._autonomous_task_ids.clear()
+        self._autonomous_tasks.clear()
         task = self._poll_task
         if self._poll_task_id is not None:
             get_task_manager().cancel_task(self._poll_task_id)
@@ -200,6 +257,13 @@ class NeoFoxzonePlugin(BasePlugin):
         self._poll_task_id = None
         self._poll_task = None
         self._poller = None
+        try:
+            await self.runtime.shutdown()
+        except Exception as error:
+            logger.error(
+                f"Neo FoxZone 共享状态保存失败: {error}",
+                exc_info=error,
+            )
 
     async def poll_now(self) -> PollReport:
         """复用当前轮询器执行一次手动检查。"""

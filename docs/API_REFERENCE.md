@@ -5,7 +5,7 @@
 组件签名：
 
 ```text
-neo-foxzone:service:neo_foxzone_service
+neo-foxzone:service:qzone_service
 ```
 
 所有方法返回 OneBot 原始响应 `dict[str, Any]`。常见结构：
@@ -46,6 +46,38 @@ async def get_qzone_feeds(
 ```
 
 获取当前登录 QQ 可见的好友空间动态。`page_num` 从 1 开始。
+
+### `get_qzone_msg_detail`（内部自动回复能力）
+
+```python
+async def get_qzone_msg_detail(
+    tid: str,
+    host_uin: int,
+) -> dict[str, Any]
+```
+
+使用 OneBot Expand 的短生命周期 QZone 兼容客户端读取单条说说及完整评论树。该方法不
+注册为 LLM Tool 或新的 OneBot action；调用成功时，评论树中的 `comment_id` 和
+`parent_comment_id` 可用于关系验证。调用方不得将列表摘要中的评论 ID 用作楼中楼目标。
+
+### `reply_qzone_comment`（内部自动回复能力）
+
+```python
+async def reply_qzone_comment(
+    *,
+    tid: str,
+    host_uin: int,
+    root_comment_id: str,
+    target_uin: int,
+    target_name: str,
+    content: str,
+    self_uin: int | None = None,
+) -> dict[str, Any]
+```
+
+在详情确认的顶层评论线程中发送一条楼中楼回复。`root_comment_id` 必须来自
+`get_qzone_msg_detail` 的完整评论树；校验失败、详情缺失或 QZone Cookie 不可用时，调用
+失败且不会回退为 `comment_qzone`。
 
 ### `send_qzone_msg`
 
@@ -184,7 +216,7 @@ service.response_error(response)
 所有 Tool 和 Command 依赖：
 
 ```text
-neo-foxzone:service:neo_foxzone_service
+neo-foxzone:service:qzone_service
 ```
 
 Neo FoxZone Service 依赖：

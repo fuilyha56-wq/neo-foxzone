@@ -44,3 +44,7 @@ htmlcov/
 # MoFox-Bot specific
 config/local_*.toml
 *.log
+
+# Runtime data / media cache / logs (added by DSH 2026-08-19)
+data/
+media_cache/

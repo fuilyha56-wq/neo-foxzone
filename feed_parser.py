@@ -36,6 +36,8 @@ class ReplyCandidate:
     commenter_name: str
     comment_content: str
     parent_comment_id: str | None
+    root_comment_id: str | None
+    detail_verified: bool
     parent_content: str
     target_uin: int | None
 
@@ -220,6 +222,8 @@ def _build_candidate(
     parent: dict[str, Any] | None,
     comment_id: str,
     parent_comment_id: str | None,
+    root_comment_id: str | None,
+    detail_verified: bool,
     target_uin: int | None,
 ) -> ReplyCandidate | None:
     """从已通过安全判据的原始对象构造候选。"""
@@ -240,14 +244,31 @@ def _build_candidate(
         commenter_name=_string_value(comment, ("nickname", "name", "nick")),
         comment_content=comment_content,
         parent_comment_id=parent_comment_id,
+        root_comment_id=root_comment_id,
+        detail_verified=detail_verified,
         parent_content=_comment_content(parent or {}),
         target_uin=target_uin,
     )
 
 
+def _root_comment_id(graph: _CommentGraph, comment_id: str) -> str | None:
+    """解析评论所在线程的顶层评论 ID，关系不完整时拒绝猜测。"""
+    current_id = comment_id
+    visited: set[str] = set()
+    while True:
+        if current_id in visited or current_id not in graph.by_id:
+            return None
+        visited.add(current_id)
+        parent_id = graph.parent_by_id.get(current_id)
+        if parent_id is None:
+            return current_id
+        current_id = parent_id
+
+
 def _own_post_candidates(
     posts: list[dict[str, Any]],
     bot_uin: int,
+    detail_verified: bool,
 ) -> list[ReplyCandidate]:
     """找出自己说说中线程末尾尚未被 Bot 回复的评论。"""
     candidates: list[ReplyCandidate] = []
@@ -270,6 +291,8 @@ def _own_post_candidates(
                 parent=graph.by_id.get(parent_id or ""),
                 comment_id=comment_id,
                 parent_comment_id=parent_id,
+                root_comment_id=_root_comment_id(graph, comment_id),
+                detail_verified=detail_verified,
                 target_uin=None,
             )
             if candidate is not None:
@@ -281,6 +304,8 @@ def _friend_feed_candidates(
     feeds: list[dict[str, Any]],
     bot_uin: int,
     known_bot_comment_ids: dict[str, set[str]],
+    known_bot_comment_roots: dict[str, dict[str, str]],
+    detail_verified: bool,
 ) -> list[ReplyCandidate]:
     """找出好友说说中可证明为直接回复 Bot 的未处理评论。"""
     candidates: list[ReplyCandidate] = []
@@ -297,6 +322,7 @@ def _friend_feed_candidates(
         post_id = _string_value(post, ("tid", "key", "id", "feedskey"))
         post_key = f"{owner_uin}:{post_id}"
         bot_comment_ids.update(known_bot_comment_ids.get(post_key, set()))
+        persisted_roots = known_bot_comment_roots.get(post_key, {})
         for comment_id in graph.ordered_ids:
             comment = graph.by_id[comment_id]
             if _comment_uin(comment) in {0, bot_uin}:
@@ -312,6 +338,12 @@ def _friend_feed_candidates(
                 for reply in graph.children_by_parent.get(comment_id, [])
             ):
                 continue
+            root_comment_id = _root_comment_id(graph, comment_id)
+            if root_comment_id is None and parent_id in bot_comment_ids:
+                persisted_root = str(persisted_roots.get(parent_id, "")).strip()
+                root_comment_id = persisted_root or None
+            if root_comment_id is None:
+                continue
             candidate = _build_candidate(
                 source="friend_feed",
                 post=post,
@@ -319,6 +351,8 @@ def _friend_feed_candidates(
                 parent=graph.by_id.get(parent_id or ""),
                 comment_id=comment_id,
                 parent_comment_id=parent_id,
+                root_comment_id=root_comment_id,
+                detail_verified=detail_verified,
                 target_uin=owner_uin,
             )
             if candidate is not None:
@@ -331,6 +365,8 @@ def extract_reply_candidates(
     *,
     bot_uin: int,
     known_bot_comment_ids: dict[str, set[str]] | None = None,
+    known_bot_comment_roots: dict[str, dict[str, str]] | None = None,
+    detail_verified: bool = False,
 ) -> list[ReplyCandidate]:
     """从 OneBot 响应中提取可安全自动回复的评论。"""
     if bot_uin <= 0 or not isinstance(response, dict):
@@ -340,8 +376,14 @@ def extract_reply_candidates(
     posts = _as_dict_list(payload.get("msglist"))
     feeds = _as_dict_list(payload.get("feeds"))
     return [
-        *_own_post_candidates(posts, bot_uin),
-        *_friend_feed_candidates(feeds, bot_uin, known_bot_comment_ids or {}),
+        *_own_post_candidates(posts, bot_uin, detail_verified),
+        *_friend_feed_candidates(
+            feeds,
+            bot_uin,
+            known_bot_comment_ids or {},
+            known_bot_comment_roots or {},
+            detail_verified,
+        ),
     ]
 
 

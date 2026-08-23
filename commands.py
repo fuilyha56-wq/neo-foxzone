@@ -38,9 +38,9 @@ def _parse_int_list(value: str) -> list[int] | None:
 class NeoFoxzoneCommand(BaseCommand):
     """提供全部 QQ 空间说说能力的运营者命令。"""
 
-    command_name = "neofoxzone"
+    command_name = "neo-foxzone"
     command_description = "Neo FoxZone QQ 空间说说管理命令"
-    name = "neofoxzone"
+    name = "neo-foxzone"
     description = "查询、发布、删除、互动和管理 QQ 空间说说"
     permission_level = PermissionLevel.OPERATOR
     command_prefix = "/"
@@ -100,22 +100,64 @@ class NeoFoxzoneCommand(BaseCommand):
     async def handle_help(self) -> tuple[bool, str]:
         """显示完整命令帮助。"""
         return True, (
+            "用法：/neo-foxzone send [主题]\n"
             "Neo FoxZone 命令：\n"
-            "/neofoxzone status\n"
-            "/neofoxzone posts [pos] [num]\n"
-            "/neofoxzone feeds [page_num] [count]\n"
-            "/neofoxzone publish \"正文\" [图片逗号列表] [权限] [QQ逗号列表]\n"
-            "/neofoxzone publish-ai \"正文\" \"画面描述\" [photo|drawing] [权限] [QQ逗号列表]\n"
-            "/neofoxzone poll-now\n"
-            "/neofoxzone poll-status\n"
-            "/neofoxzone delete <tid>\n"
-            "/neofoxzone like <tid> [发布者QQ]\n"
-            "/neofoxzone unlike <tid> [发布者QQ]\n"
-            "/neofoxzone comment <tid> \"正文\" [发布者QQ] [图片逗号列表]\n"
-            "/neofoxzone ban <QQ号> [true|false]\n"
-            "/neofoxzone visibility <tid> <权限> [QQ逗号列表]\n"
+            "/neo-foxzone status\n"
+            "/neo-foxzone posts [pos] [num]\n"
+            "/neo-foxzone feeds [page_num] [count]\n"
+            "/neo-foxzone send [主题片段(最多6个)]\n"
+            "/neo-foxzone publish \"正文\" [图片逗号列表] [权限] [QQ逗号列表]\n"
+            "/neo-foxzone publish-ai \"正文\" \"画面描述\" [photo|drawing] [权限] [QQ逗号列表]\n"
+            "/neo-foxzone poll-now\n"
+            "/neo-foxzone poll-status\n"
+            "/neo-foxzone delete <tid>\n"
+            "/neo-foxzone like <tid> [发布者QQ]\n"
+            "/neo-foxzone unlike <tid> [发布者QQ]\n"
+            "/neo-foxzone comment <tid> \"正文\" [发布者QQ] [图片逗号列表]\n"
+            "/neo-foxzone ban <QQ号> [true|false]\n"
+            "/neo-foxzone visibility <tid> <权限> [QQ逗号列表]\n"
             "权限：1=所有人，4=好友，16=部分好友，64=仅自己，128=部分好友不可见。"
         )
+
+    @cmd_route("send")
+    async def handle_send(
+        self,
+        w0: str = "",
+        w1: str = "",
+        w2: str = "",
+        w3: str = "",
+        w4: str = "",
+        w5: str = "",
+    ) -> tuple[bool, str]:
+        """以合并主题发表说说，保持原版 FoxZone 的 send 语义。"""
+        try:
+            service = self._service()
+        except NeoFoxzoneError as error:
+            return False, str(error)
+
+        config = service.plugin.config
+        if not getattr(config, "plugin", None) or not config.plugin.enabled:
+            return False, "FoxZone 插件当前已禁用。"
+
+        topic = " ".join(
+            part for part in (w0, w1, w2, w3, w4, w5) if part
+        ).strip()
+
+        try:
+            generated = await service.generate_topic_content(topic=topic)
+        except NeoFoxzoneError as error:
+            return False, f"发布说说失败：{error}"
+        except Exception as error:
+            return False, f"发布说说失败：{error}"
+
+        if not generated.get("success"):
+            return False, f"发布说说失败：{generated.get('message', '未知错误')}"
+
+        content = str(generated.get("message", "")).strip()
+        succeeded = await service.publish_feed(content)
+        if not succeeded:
+            return False, f"发布说说失败：{content}"
+        return True, f"说说已发布！内容：{content}"
 
     @cmd_route("status")
     async def handle_status(self) -> tuple[bool, str]:

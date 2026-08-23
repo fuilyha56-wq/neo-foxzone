@@ -24,6 +24,25 @@ class OneBotQzoneService(Protocol):
         """获取好友动态。"""
         ...
 
+    async def get_qzone_msg_detail(
+        self,
+        tid: str,
+        host_uin: int,
+    ) -> dict[str, Any]:
+        """获取单条说说及其完整评论树。"""
+        ...
+
+    async def get_qzone_user_feeds(
+        self,
+        *,
+        host_uin: int,
+        pos: int = 0,
+        num: int = 5,
+        self_uin: int | None = None,
+    ) -> dict[str, Any]:
+        """读取指定 QQ 可见的说说列表。"""
+        ...
+
     async def send_qzone_msg(
         self,
         content: str,
@@ -62,6 +81,20 @@ class OneBotQzoneService(Protocol):
         images: list[str] | None = None,
     ) -> dict[str, Any]:
         """评论说说。"""
+        ...
+
+    async def reply_qzone_comment(
+        self,
+        *,
+        tid: str,
+        host_uin: int,
+        root_comment_id: str,
+        target_uin: int,
+        target_name: str,
+        content: str,
+        self_uin: int | None = None,
+    ) -> dict[str, Any]:
+        """在指定顶层评论下发送一条楼中楼回复。"""
         ...
 
     async def set_qzone_ban(

@@ -1,13 +1,13 @@
 {
   "name": "neo-foxzone",
-  "display_name": "Neo FoxZone",
-  "version": "0.1.1",
-  "description": "基于 OneBot Expand 的 QQ 空间说说插件，支持完整管理、评论轮询自动回复与可替换 AI 生图发布",
+  "display_name": "Neo-FoxZone",
+  "version": "0.1.3",
+  "description": "基于 OneBot Expand 的 QQ 空间说说插件，支持完整管理、评论轮询自动回复、自治互动与可替换 AI 生图发布",
   "author": "MoFox Team",
   "license": "AGPL-3.0",
   "dependencies": {
     "plugins": [
-      "onebot_expand>=1.0.13"
+      "onebot_expand>=1.0.17"
     ],
     "components": [
       "onebot_expand:service:qzone_service",
@@ -17,7 +17,7 @@
   "include": [
     {
       "component_type": "service",
-      "component_name": "neo_foxzone_service",
+      "component_name": "qzone_service",
       "dependencies": [
         "onebot_expand:service:qzone_service"
       ],
@@ -25,9 +25,9 @@
     },
     {
       "component_type": "command",
-      "component_name": "neofoxzone",
+      "component_name": "neo-foxzone",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -35,7 +35,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_list_posts",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -43,7 +43,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_list_feeds",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -51,7 +51,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_publish",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -59,7 +59,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_publish_generated",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -67,7 +67,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_delete",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -75,7 +75,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_like",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -83,7 +83,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_unlike",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -91,7 +91,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_comment",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -99,7 +99,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_set_blacklist",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
@@ -107,7 +107,7 @@
       "component_type": "tool",
       "component_name": "neo_foxzone_set_visibility",
       "dependencies": [
-        "neo-foxzone:service:neo_foxzone_service"
+        "neo-foxzone:service:qzone_service"
       ],
       "enabled": true
     },
