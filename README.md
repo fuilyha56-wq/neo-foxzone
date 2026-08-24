@@ -1,6 +1,6 @@
 # Neo FoxZone
 
-Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。当前版本为 `0.1.3`。它以
+Neo FoxZone 是一个面向 Neo-MoFox 的 QQ 空间说说插件。当前版本为 `0.1.4`。它以
 [OneBot Expand](https://github.com/fuilyha56-wq/onebot_expand) 为硬前置，通过
 QZone Service 调用 OneBot 协议端，并通过 Account Service 识别当前 Bot QQ。
 

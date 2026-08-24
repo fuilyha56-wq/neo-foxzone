@@ -518,10 +518,10 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.3"
+    assert plugin.plugin_version == "0.1.4"
     assert plugin.dependencies == [BACKEND_SIGNATURE, ACCOUNT_SIGNATURE]
-    assert plugin.config.plugin.version == "0.1.3"
-    assert NeoFoxzoneService.version == "0.1.3"
+    assert plugin.config.plugin.version == "0.1.4"
+    assert NeoFoxzoneService.version == "0.1.4"
 
 
 def test_manifest_declares_market_and_runtime_dependency() -> None:
@@ -530,7 +530,7 @@ def test_manifest_declares_market_and_runtime_dependency() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.3"
+    assert manifest["version"] == "0.1.4"
     assert manifest["dependencies"]["plugins"] == [
         "onebot_expand>=1.0.17"
     ]

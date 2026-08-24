@@ -1,9 +1,9 @@
 {
   "name": "neo-foxzone",
   "display_name": "Neo-FoxZone",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "基于 OneBot Expand 的 QQ 空间说说插件，支持完整管理、评论轮询自动回复、自治互动与可替换 AI 生图发布",
-  "author": "MoFox Team",
+  "author": "Lycoris-flower",
   "license": "AGPL-3.0",
   "dependencies": {
     "plugins": [
@@ -119,7 +119,11 @@
     }
   ],
   "entry_point": "plugin.py",
-  "api_version": "1.0.0",
+  "api_version": {
+    "llm_api": "1.0.0",
+    "service_api": "1.0.0",
+    "storage_api": "1.0.0"
+  },
   "min_core_version": "1.0.0",
   "python_dependencies": [],
   "dependencies_required": true,
