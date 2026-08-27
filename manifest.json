@@ -1,7 +1,7 @@
 {
   "name": "neo-foxzone",
   "display_name": "Neo-FoxZone",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "基于 OneBot Expand 的 QQ 空间说说插件，支持完整管理、评论轮询自动回复、自治互动与可替换 AI 生图发布",
   "author": "Lycoris-flower",
   "license": "AGPL-3.0",

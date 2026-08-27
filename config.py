@@ -20,7 +20,7 @@ class NeoFoxzoneConfig(BaseConfig):
 
         enabled: bool = Field(default=True, description="启用 Neo FoxZone。")
         version: str = Field(
-            default="0.1.4",
+            default="0.1.5",
             description="当前插件版本。",
             disabled=True,
         )
@@ -115,6 +115,22 @@ class NeoFoxzoneConfig(BaseConfig):
         failure_retry_minutes: float = Field(
             default=30.0,
             description="LLM 或协议明确失败后的基础重试间隔（分钟）。",
+        )
+        rate_limit_retry_minutes: float = Field(
+            default=120.0,
+            description="触发 QZone 频率限制（subcode=1012/-10049）后的退避间隔（分钟）。",
+        )
+        send_jitter_seconds_min: float = Field(
+            default=15.0,
+            description="同一轮内相邻两次回复发送之间的最小随机等待（秒），对齐原版防风控节奏。",
+        )
+        send_jitter_seconds_max: float = Field(
+            default=30.0,
+            description="同一轮内相邻两次回复发送之间的最大随机等待（秒）。",
+        )
+        detail_request_interval_seconds: float = Field(
+            default=1.5,
+            description="相邻两条说说详情请求之间的最小间隔（秒），避免详情风暴触发风控。",
         )
         state_max_entries: int = Field(
             default=2000,

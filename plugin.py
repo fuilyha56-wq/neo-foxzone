@@ -41,7 +41,7 @@ class NeoFoxzonePlugin(BasePlugin):
 
     plugin_name = "neo-foxzone"
     plugin_description = "基于 OneBot Expand 的 QQ 空间说说全功能插件"
-    plugin_version = "0.1.4"
+    plugin_version = "0.1.5"
     configs = [NeoFoxzoneConfig]
     dependencies = [BACKEND_SERVICE_SIGNATURE, ACCOUNT_SERVICE_SIGNATURE]
 

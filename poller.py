@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -24,6 +26,18 @@ logger = get_logger("neo_foxzone.poller")
 
 ReplyGenerator = Callable[[ReplyCandidate], Awaitable[str]]
 BotUinLoader = Callable[[], Awaitable[int]]
+
+#: QZone 频率限制错误特征（subcode=1012「使用人数过多」/ code=-10049 反爬限流）。
+#: 命中后使用比普通失败更长的退避间隔，避免持续触发风控。
+_RATE_LIMIT_PATTERN = re.compile(
+    r"subcode[=(]\s*(?:1012|-?10049)\b|code[=(]\s*-?10049\b",
+    flags=re.IGNORECASE,
+)
+
+
+def is_rate_limit_error(error: Exception | str) -> bool:
+    """判断异常或错误文本是否为 QZone 频率限制类错误。"""
+    return bool(_RATE_LIMIT_PATTERN.search(str(error)))
 
 _SYSTEM_PROMPT = """你负责回复 QQ 空间说说下的一条评论。
 请根据说说正文、评论上下文和对方当前评论，生成自然、简洁、符合日常社交语境的中文回复。
@@ -220,6 +234,7 @@ class QzoneReplyPoller:
         self._bot_uin_loader = bot_uin_loader or self._load_bot_uin
         self._poll_lock = asyncio.Lock()
         self.last_report: PollReport | None = None
+        self._sent_this_poll = 0
 
     def _config(self) -> NeoFoxzoneConfig:
         """返回插件配置，异常装配时使用默认配置。"""
@@ -326,6 +341,10 @@ class QzoneReplyPoller:
         attempts = 0
         source_label = "自身说说" if source == "own_post" else "好友动态"
         container_key = "msglist" if source == "own_post" else "feeds"
+        detail_interval = max(
+            0.0,
+            float(self._config().polling.detail_request_interval_seconds),
+        )
         for post in posts:
             post_id = self._post_id(post)
             if not post_id:
@@ -352,6 +371,8 @@ class QzoneReplyPoller:
                     continue
 
             attempts += 1
+            if attempts > 1 and detail_interval > 0:
+                await asyncio.sleep(detail_interval)
             try:
                 detail_response = await get_detail(post_id, host_uin)
             except Exception as error:
@@ -618,9 +639,16 @@ class QzoneReplyPoller:
                 return [*candidates[pivot:], *candidates[:pivot]]
         return candidates
 
-    def _retry_after(self, identity: str) -> float:
-        """按失败次数计算有上限的指数退避时间。"""
+    def _retry_after(self, identity: str, *, rate_limited: bool = False) -> float:
+        """按失败次数计算有上限的指数退避时间。
+
+        频率限制类失败使用独立的更长退避基数，且不随次数指数放大
+        （QZone 风控窗口通常以小时计，指数放大意义不大）。
+        """
         config = self._config().polling
+        if rate_limited:
+            base_seconds = max(60.0, float(config.rate_limit_retry_minutes) * 60.0)
+            return time.time() + base_seconds
         base_seconds = max(1.0, float(config.failure_retry_minutes) * 60.0)
         exponent = min(self.state.failure_count(identity), 4)
         return time.time() + base_seconds * (2**exponent)
@@ -632,13 +660,20 @@ class QzoneReplyPoller:
         report: PollReport,
     ) -> bool:
         """持久化明确失败；返回是否可继续处理本轮候选。"""
+        rate_limited = is_rate_limit_error(error)
         self.state.record_failure(
             identity,
-            retry_after=self._retry_after(identity),
+            retry_after=self._retry_after(identity, rate_limited=rate_limited),
         )
         report.failed += 1
         report.reply_errors.append(f"{identity}: {error}")
-        logger.warning(f"自动回复评论失败 ({identity}): {error}")
+        if rate_limited:
+            logger.warning(
+                f"自动回复评论失败 ({identity}): {error}；"
+                "已识别为 QZone 频率限制，本轮剩余候选全部跳过并使用长退避。"
+            )
+        else:
+            logger.warning(f"自动回复评论失败 ({identity}): {error}")
         try:
             await self.state.save()
         except Exception as state_error:
@@ -648,12 +683,14 @@ class QzoneReplyPoller:
                 exc_info=state_error,
             )
             return False
-        return True
+        # 触发限流后继续发送只会加重风控，终止本轮处理。
+        return not rate_limited
 
     async def poll_once(self) -> PollReport:
         """执行一次完整检查；仅成功发布的评论会写入去重状态。"""
         async with self._poll_lock:
             report = PollReport()
+            self._sent_this_poll = 0
             logger.info(
                 "Neo FoxZone 评论检查开始: "
                 "正在确认 Bot QQ，并读取自身说说与好友动态。"
@@ -770,12 +807,27 @@ class QzoneReplyPoller:
                     break
 
                 try:
+                    if report.replied > 0 or self._sent_this_poll > 0:
+                        jitter_min = max(
+                            0.0,
+                            float(config.send_jitter_seconds_min),
+                        )
+                        jitter_max = max(
+                            jitter_min,
+                            float(config.send_jitter_seconds_max),
+                        )
+                        delay = random.uniform(jitter_min, jitter_max)
+                        logger.info(
+                            f"发送间隔抖动: 等待 {delay:.1f}s 后发送下一条回复。"
+                        )
+                        await asyncio.sleep(delay)
                     logger.info(f"自动回复发送开始: {label}。")
                     response = await self._send_thread_reply(
                         candidate,
                         reply,
                         bot_uin,
                     )
+                    self._sent_this_poll += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:

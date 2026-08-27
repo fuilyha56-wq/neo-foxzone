@@ -29,7 +29,7 @@ class NeoFoxzoneService(BaseService):
     service_description = "基于 OneBot Expand 的 QQ 空间说说全功能服务"
     name = "qzone_service"
     description = "基于 OneBot Expand 的 QQ 空间说说全功能服务"
-    version = "0.1.4"
+    version = "0.1.5"
     dependencies = [BACKEND_SERVICE_SIGNATURE]
 
     def _config(self) -> NeoFoxzoneConfig:

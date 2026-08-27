@@ -518,10 +518,10 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.4"
+    assert plugin.plugin_version == "0.1.5"
     assert plugin.dependencies == [BACKEND_SIGNATURE, ACCOUNT_SIGNATURE]
-    assert plugin.config.plugin.version == "0.1.4"
-    assert NeoFoxzoneService.version == "0.1.4"
+    assert plugin.config.plugin.version == "0.1.5"
+    assert NeoFoxzoneService.version == "0.1.5"
 
 
 def test_manifest_declares_market_and_runtime_dependency() -> None:
@@ -530,7 +530,7 @@ def test_manifest_declares_market_and_runtime_dependency() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.4"
+    assert manifest["version"] == "0.1.5"
     assert manifest["dependencies"]["plugins"] == [
         "onebot_expand>=1.0.17"
     ]
@@ -2069,3 +2069,302 @@ async def test_service_forwards_internal_user_feed_query(
             },
         )
     ]
+
+
+def test_rate_limit_error_detection() -> None:
+    """1012 与 -10049 文本都应识别为 QZone 频率限制。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    is_rate_limit_error = poller_module.is_rate_limit_error
+
+    assert is_rate_limit_error(
+        RuntimeError("QZone 请求失败（subcode=1012）: 使用人数过多，请稍后再试")
+    )
+    assert is_rate_limit_error(RuntimeError("QZone 限流（code=-10049）"))
+    assert is_rate_limit_error("回复接口返回错误: code=-10049, subcode=-106")
+    assert not is_rate_limit_error(RuntimeError("QZone 响应为空。"))
+    assert not is_rate_limit_error(RuntimeError("评论正文不能为空。"))
+
+
+@pytest.mark.asyncio
+async def test_poller_stops_batch_and_backs_off_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """触发 QZone 频率限制后应终止本轮剩余候选并使用长退避。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    QzoneReplyPoller = poller_module.QzoneReplyPoller
+    PollingState = state_module.PollingState
+
+    async def save_json(
+        store_name: str,
+        name: str,
+        data: dict[str, Any],
+    ) -> None:
+        """静默保存。"""
+
+    monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+
+    class FakeLogger:
+        """收集日志。"""
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def info(self, message: str) -> None:
+            self.messages.append(message)
+
+        def warning(self, message: str) -> None:
+            self.messages.append(message)
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            self.messages.append(message)
+
+    fake_logger = FakeLogger()
+    monkeypatch.setattr(poller_module, "logger", fake_logger)
+
+    class FakePollingService:
+        """两条新评论；第一条发送触发 1012 限流。"""
+
+        async def get_qzone_msg_list(
+            self,
+            pos: int = 0,
+            num: int = 10,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "msglist": [
+                        {
+                            "tid": "own-post",
+                            "content": "测试说说",
+                            "comment_num": 2,
+                            "commentlist": [],
+                        }
+                    ]
+                },
+            }
+
+        async def get_qzone_feeds(
+            self,
+            page_num: int = 1,
+            count: int = 10,
+        ) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
+
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "content": "测试说说",
+                    "commentlist": [
+                        {
+                            "comment_id": "comment-1",
+                            "uin": 20001,
+                            "nickname": "访客一",
+                            "content": "第一条",
+                            "list_3": [],
+                        },
+                        {
+                            "comment_id": "comment-2",
+                            "uin": 20002,
+                            "nickname": "访客二",
+                            "content": "第二条",
+                            "list_3": [],
+                        },
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs["target_uin"] == 20001:
+                return {
+                    "status": "failed",
+                    "retcode": -1,
+                    "data": None,
+                    "msg": "QZone 请求失败（subcode=1012）: 使用人数过多，请稍后再试",
+                }
+            raise AssertionError("触发限流后不应继续处理剩余候选")
+
+    async def generate_reply(candidate: Any) -> str:
+        """返回固定回复。"""
+        return f"回复 {candidate.comment_id}"
+
+    async def load_bot_uin() -> int:
+        """返回测试 Bot QQ。"""
+        return 99999
+
+    config = NeoFoxzoneConfig()
+    plugin = NeoFoxzonePlugin(config=config)
+    state = PollingState(max_entries=20)
+    service = FakePollingService()
+    poller = QzoneReplyPoller(
+        plugin,
+        service=service,
+        state=state,
+        reply_generator=generate_reply,
+        bot_uin_loader=load_bot_uin,
+    )
+
+    report = await poller.poll_once()
+
+    assert report.replied == 0
+    assert report.failed == 1
+    identity = "own_post:99999:own-post:comment-1"
+    assert state.is_processed(identity) is False
+    retry_after = state.retry_after(identity)
+    # 限流退避（默认 120 分钟）应远大于普通失败退避（30 分钟起步）。
+    assert retry_after > asyncio.get_event_loop().time() + 3600
+    assert any(
+        "频率限制" in message and "本轮剩余候选全部跳过" in message
+        for message in fake_logger.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_poller_jitters_between_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一轮内第二条及以后的回复发送前应有随机抖动等待。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    QzoneReplyPoller = poller_module.QzoneReplyPoller
+    PollingState = state_module.PollingState
+
+    sleep_calls: list[float] = []
+    real_sleep = poller_module.asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(poller_module.asyncio, "sleep", fake_sleep)
+
+    async def save_json(
+        store_name: str,
+        name: str,
+        data: dict[str, Any],
+    ) -> None:
+        """静默保存。"""
+
+    monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+
+    class FakeLogger:
+        """静默日志。"""
+
+        def info(self, message: str) -> None:
+            pass
+
+        def warning(self, message: str) -> None:
+            pass
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            pass
+
+    monkeypatch.setattr(poller_module, "logger", FakeLogger())
+
+    class FakePollingService:
+        """两条新评论，全部可成功回复。"""
+
+        async def get_qzone_msg_list(
+            self,
+            pos: int = 0,
+            num: int = 10,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "msglist": [
+                        {
+                            "tid": "own-post",
+                            "content": "测试说说",
+                            "comment_num": 2,
+                            "commentlist": [],
+                        }
+                    ]
+                },
+            }
+
+        async def get_qzone_feeds(
+            self,
+            page_num: int = 1,
+            count: int = 10,
+        ) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
+
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "content": "测试说说",
+                    "commentlist": [
+                        {
+                            "comment_id": "comment-1",
+                            "uin": 30001,
+                            "nickname": "访客一",
+                            "content": "第一条",
+                            "list_3": [],
+                        },
+                        {
+                            "comment_id": "comment-2",
+                            "uin": 30002,
+                            "nickname": "访客二",
+                            "content": "第二条",
+                            "list_3": [],
+                        },
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"comment_id": f"bot-{kwargs['target_uin']}"},
+            }
+
+    async def generate_reply(candidate: Any) -> str:
+        """返回固定回复。"""
+        return f"回复 {candidate.comment_id}"
+
+    async def load_bot_uin() -> int:
+        """返回测试 Bot QQ。"""
+        return 99999
+
+    config = NeoFoxzoneConfig()
+    plugin = NeoFoxzonePlugin(config=config)
+    state = PollingState(max_entries=20)
+    poller = QzoneReplyPoller(
+        plugin,
+        service=FakePollingService(),
+        state=state,
+        reply_generator=generate_reply,
+        bot_uin_loader=load_bot_uin,
+    )
+
+    report = await poller.poll_once()
+
+    assert report.replied == 2
+    # 详情节流（1 条间隔）+ 发送抖动（1 次间隔）。
+    assert len(sleep_calls) >= 1
+    jitter_sleeps = [
+        delay
+        for delay in sleep_calls
+        if config.polling.send_jitter_seconds_min <= delay
+    ]
+    assert len(jitter_sleeps) == 1
