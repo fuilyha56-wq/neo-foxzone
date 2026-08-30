@@ -639,15 +639,26 @@ class QzoneReplyPoller:
                 return [*candidates[pivot:], *candidates[:pivot]]
         return candidates
 
-    def _retry_after(self, identity: str, *, rate_limited: bool = False) -> float:
-        """按失败次数计算有上限的指数退避时间。
+    def _retry_after(
+        self,
+        identity: str,
+        *,
+        rate_limited: bool = False,
+        generation_failed: bool = False,
+    ) -> float:
+        """按失败类型计算下一次允许重试的时间。
 
-        频率限制类失败使用独立的更长退避基数，且不随次数指数放大
-        （QZone 风控窗口通常以小时计，指数放大意义不大）。
+        - 频率限制：固定长退避（QZone 风控窗口以小时计，指数放大无意义）；
+        - LLM 生成失败：固定短退避（与 QZone 发送无关，网关抖动不应
+          让候选退避数小时，对齐原版「决策失败仅跳过该批」的宽松语义）；
+        - 协议发送失败：有上限的指数退避。
         """
         config = self._config().polling
         if rate_limited:
             base_seconds = max(60.0, float(config.rate_limit_retry_minutes) * 60.0)
+            return time.time() + base_seconds
+        if generation_failed:
+            base_seconds = max(30.0, float(config.generation_retry_minutes) * 60.0)
             return time.time() + base_seconds
         base_seconds = max(1.0, float(config.failure_retry_minutes) * 60.0)
         exponent = min(self.state.failure_count(identity), 4)
@@ -658,12 +669,18 @@ class QzoneReplyPoller:
         identity: str,
         error: Exception,
         report: PollReport,
+        *,
+        generation_failed: bool = False,
     ) -> bool:
         """持久化明确失败；返回是否可继续处理本轮候选。"""
-        rate_limited = is_rate_limit_error(error)
+        rate_limited = not generation_failed and is_rate_limit_error(error)
         self.state.record_failure(
             identity,
-            retry_after=self._retry_after(identity, rate_limited=rate_limited),
+            retry_after=self._retry_after(
+                identity,
+                rate_limited=rate_limited,
+                generation_failed=generation_failed,
+            ),
         )
         report.failed += 1
         report.reply_errors.append(f"{identity}: {error}")
@@ -671,6 +688,11 @@ class QzoneReplyPoller:
             logger.warning(
                 f"自动回复评论失败 ({identity}): {error}；"
                 "已识别为 QZone 频率限制，本轮剩余候选全部跳过并使用长退避。"
+            )
+        elif generation_failed:
+            logger.warning(
+                f"自动回复生成失败 ({identity}): {error}；"
+                "决策=短退避后下轮重试，不影响本轮其他候选。"
             )
         else:
             logger.warning(f"自动回复评论失败 ({identity}): {error}")
@@ -786,6 +808,7 @@ class QzoneReplyPoller:
                         candidate.identity,
                         error,
                         report,
+                        generation_failed=True,
                     ):
                         break
                     continue

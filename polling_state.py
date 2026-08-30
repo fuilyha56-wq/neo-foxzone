@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,7 +10,12 @@ from src.app.plugin_system.api import storage_api
 
 STORE_NAME = "neo-foxzone"
 STATE_NAME = "polling_state"
-STATE_VERSION = 3
+STATE_VERSION = 5
+
+#: 占用超过该秒数后视为远端写入早已结束，允许重新处理。
+#: 默认 1 小时：一轮轮询最长几分钟，进程重启后遗留占用在 1 小时后过期，
+#: 避免一次发送异常导致候选被永久跳过（对齐原版「成功才标记」的宽松语义）。
+DEFAULT_IN_FLIGHT_TIMEOUT_SECONDS = 3600.0
 
 
 def _string_list(value: Any) -> list[str]:
@@ -74,8 +80,10 @@ class PollingState:
     """保存已处理评论与 Bot 自己发出的评论引用。"""
 
     max_entries: int = 2000
+    in_flight_timeout_seconds: float = DEFAULT_IN_FLIGHT_TIMEOUT_SECONDS
     processed_comment_ids: list[str] = field(default_factory=list)
     in_flight_comment_ids: list[str] = field(default_factory=list)
+    in_flight_reserved_at: dict[str, float] = field(default_factory=dict)
     bot_comments_by_post: dict[str, list[str]] = field(default_factory=dict)
     bot_comment_roots_by_post: dict[str, dict[str, str]] = field(default_factory=dict)
     retry_after_by_identity: dict[str, float] = field(default_factory=dict)
@@ -94,6 +102,9 @@ class PollingState:
         )
         state.in_flight_comment_ids = _string_list(
             payload.get("in_flight_comment_ids")
+        )
+        state.in_flight_reserved_at = _string_float_map(
+            payload.get("in_flight_reserved_at")
         )
         raw_comments = payload.get("bot_comments_by_post")
         if isinstance(raw_comments, dict):
@@ -131,8 +142,19 @@ class PollingState:
         return str(identity).strip() in self.processed_comment_ids
 
     def is_in_flight(self, identity: str) -> bool:
-        """判断评论是否已在远端写入前持久占用。"""
-        return str(identity).strip() in self.in_flight_comment_ids
+        """判断评论是否仍在占用有效期内。
+
+        占用超过 ``in_flight_timeout_seconds`` 后视为远端写入早已结束，
+        自动过期并允许重新处理，避免一次发送异常导致候选被永久跳过。
+        """
+        normalized = str(identity).strip()
+        if normalized not in self.in_flight_comment_ids:
+            return False
+        reserved_at = self.in_flight_reserved_at.get(normalized, 0.0)
+        if time.time() - reserved_at <= max(1.0, float(self.in_flight_timeout_seconds)):
+            return True
+        self.release(normalized)
+        return False
 
     def reserve(self, identity: str) -> None:
         """在远端写入前占用评论，防止重启后重复发送。"""
@@ -142,6 +164,7 @@ class PollingState:
         if normalized in self.in_flight_comment_ids:
             self.in_flight_comment_ids.remove(normalized)
         self.in_flight_comment_ids.append(normalized)
+        self.in_flight_reserved_at[normalized] = time.time()
         self._trim()
 
     def release(self, identity: str) -> None:
@@ -149,6 +172,7 @@ class PollingState:
         normalized = str(identity).strip()
         if normalized in self.in_flight_comment_ids:
             self.in_flight_comment_ids.remove(normalized)
+        self.in_flight_reserved_at.pop(normalized, None)
 
     def mark_processed(self, identity: str) -> None:
         """把评论标记为已成功处理，并保持最近使用顺序。"""
@@ -242,6 +266,16 @@ class PollingState:
             self.processed_comment_ids = self.processed_comment_ids[-maximum:]
         if len(self.in_flight_comment_ids) > maximum:
             self.in_flight_comment_ids = self.in_flight_comment_ids[-maximum:]
+        if len(self.in_flight_reserved_at) > maximum:
+            self.in_flight_reserved_at = dict(
+                list(self.in_flight_reserved_at.items())[-maximum:]
+            )
+        # 清理已不在占用列表中的孤儿时间戳。
+        self.in_flight_reserved_at = {
+            identity: reserved_at
+            for identity, reserved_at in self.in_flight_reserved_at.items()
+            if identity in self.in_flight_comment_ids
+        }
         if len(self.retry_after_by_identity) > maximum:
             self.retry_after_by_identity = dict(
                 list(self.retry_after_by_identity.items())[-maximum:]
@@ -297,6 +331,7 @@ class PollingState:
                 "version": STATE_VERSION,
                 "processed_comment_ids": list(self.processed_comment_ids),
                 "in_flight_comment_ids": list(self.in_flight_comment_ids),
+                "in_flight_reserved_at": dict(self.in_flight_reserved_at),
                 "bot_comments_by_post": {
                     key: list(values)
                     for key, values in self.bot_comments_by_post.items()

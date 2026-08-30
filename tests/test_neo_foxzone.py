@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -208,6 +209,87 @@ def _build_runtime(
     return plugin, service, backend
 
 
+class FakeDirectClient:
+    """记录 QZone 直连客户端调用的替身。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录与可配置返回数据。"""
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.user_feeds: list[dict[str, Any]] = []
+        self.msg_detail: dict[str, Any] = {}
+
+    async def get_msg_detail(self, host_uin: int, tid: str) -> dict[str, Any]:
+        """记录详情读取并返回预设数据。"""
+        self.calls.append(("get_msg_detail", {"host_uin": host_uin, "tid": tid}))
+        return self.msg_detail
+
+    async def get_user_feeds(
+        self,
+        *,
+        host_uin: int,
+        pos: int = 0,
+        num: int = 5,
+    ) -> list[dict[str, Any]]:
+        """记录列表读取并返回预设数据。"""
+        self.calls.append(
+            ("get_user_feeds", {"host_uin": host_uin, "pos": pos, "num": num})
+        )
+        return self.user_feeds
+
+    async def reply_comment(
+        self,
+        *,
+        host_uin: int,
+        tid: str,
+        root_comment_id: str,
+        target_uin: int,
+        target_name: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """记录楼中楼回复并返回成功响应。"""
+        self.calls.append(
+            (
+                "reply_comment",
+                {
+                    "host_uin": host_uin,
+                    "tid": tid,
+                    "root_comment_id": root_comment_id,
+                    "target_uin": target_uin,
+                    "target_name": target_name,
+                    "content": content,
+                },
+            )
+        )
+        return {"code": 0}
+
+
+def _install_direct_client(
+    monkeypatch: pytest.MonkeyPatch,
+    client: FakeDirectClient,
+) -> None:
+    """把 Service 模块的直连依赖替换为测试替身。"""
+
+    async def fake_fetch_cookie() -> str:
+        """返回可解析出 p_skey 与 uin 的假 Cookie。"""
+        return "p_skey=fake-skey; uin=o12345"
+
+    class FakeDirectClientFactory:
+        """按 Service 调用约定构造直连替身。"""
+
+        @classmethod
+        def create(cls, cookie_string: str) -> FakeDirectClient:
+            """忽略 Cookie 字符串并返回共享替身。"""
+            del cookie_string
+            return client
+
+    monkeypatch.setattr(
+        service_module,
+        "fetch_qzone_cookie_string",
+        fake_fetch_cookie,
+    )
+    monkeypatch.setattr(service_module, "QZoneDirectClient", FakeDirectClientFactory)
+
+
 @pytest.mark.asyncio
 async def test_service_forwards_all_nine_qzone_actions(
     monkeypatch: pytest.MonkeyPatch,
@@ -263,8 +345,11 @@ async def test_service_forwards_all_nine_qzone_actions(
 async def test_service_forwards_detail_and_thread_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """详情和楼中楼内部能力应经校验后完整转发至 OneBot Expand。"""
+    """详情和楼中楼应经校验后走本地直连客户端。"""
     _, service, backend = _build_runtime(monkeypatch)
+    client = FakeDirectClient()
+    client.msg_detail = {"tid": "detail-tid", "uin": 10001, "commentlist": []}
+    _install_direct_client(monkeypatch, client)
 
     await service.get_qzone_msg_detail(tid=" detail-tid ", host_uin=10001)
     await service.reply_qzone_comment(
@@ -277,24 +362,25 @@ async def test_service_forwards_detail_and_thread_reply(
         self_uin=10004,
     )
 
-    assert backend.calls == [
+    assert client.calls == [
         (
-            "get_qzone_msg_detail",
-            {"tid": "detail-tid", "host_uin": 10001},
+            "get_msg_detail",
+            {"host_uin": 10001, "tid": "detail-tid"},
         ),
         (
-            "reply_qzone_comment",
+            "reply_comment",
             {
-                "tid": "reply-tid",
                 "host_uin": 10002,
+                "tid": "reply-tid",
                 "root_comment_id": "global-root-comment-id",
                 "target_uin": 10003,
                 "target_name": "被回复者",
                 "content": "楼中楼回复",
-                "self_uin": 10004,
             },
         ),
     ]
+    # 直连路径不应触达 OneBot Expand 后端。
+    assert backend.calls == []
 
 
 @pytest.mark.asyncio
@@ -303,78 +389,53 @@ async def test_legacy_service_facade_filters_reads_and_uses_shared_state(
 ) -> None:
     """原版 Service 门面应返回规范列表并复用插件级互动状态。"""
     _, service, backend = _build_runtime(monkeypatch)
-
-    async def get_user_feeds(**kwargs: Any) -> dict[str, Any]:
-        """返回一条已评论和一条待互动的说说。"""
-        return {
-            "status": "ok",
-            "retcode": 0,
-            "data": {
-                "msglist": [
-                    {"tid": "already-commented", "commentlist": []},
+    client = FakeDirectClient()
+    client.user_feeds = [
+        {"tid": "already-commented", "commentlist": []},
+        {
+            "tid": "feed-new",
+            "content": "新动态",
+            "commentlist": [
+                {
+                    "comment_id": "root-comment",
+                    "uin": 20002,
+                    "nickname": "访客",
+                    "content": "一级评论",
+                    "list_3": [
+                        {
+                            "comment_id": "child-comment",
+                            "uin": 20003,
+                            "nickname": "回复者",
+                            "content": "楼中楼评论",
+                            "list_3": [],
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+    client.msg_detail = {
+        "tid": "feed-new",
+        "uin": 20001,
+        "commentlist": [
+            {
+                "comment_id": "root-comment",
+                "uin": 20002,
+                "nickname": "访客",
+                "content": "一级评论",
+                "list_3": [
                     {
-                        "tid": "feed-new",
-                        "content": "新动态",
-                        "commentlist": [
-                            {
-                                "comment_id": "root-comment",
-                                "uin": 20002,
-                                "nickname": "访客",
-                                "content": "一级评论",
-                                "list_3": [
-                                    {
-                                        "comment_id": "child-comment",
-                                        "uin": 20003,
-                                        "nickname": "回复者",
-                                        "content": "楼中楼评论",
-                                        "list_3": [],
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                ]
-            },
-        }
-
-    async def comment_qzone(**kwargs: Any) -> dict[str, Any]:
-        """记录原版门面的写入参数。"""
-        return backend._response("comment_qzone", **kwargs)
-
-    async def get_qzone_msg_detail(
-        tid: str,
-        host_uin: int,
-    ) -> dict[str, Any]:
-        """返回用于详情门面断言的完整评论树。"""
-        return {
-            "status": "ok",
-            "retcode": 0,
-            "data": {
-                "tid": tid,
-                "uin": host_uin,
-                "commentlist": [
-                    {
-                        "comment_id": "root-comment",
-                        "uin": 20002,
-                        "nickname": "访客",
-                        "content": "一级评论",
-                        "list_3": [
-                            {
-                                "comment_id": "child-comment",
-                                "uin": 20003,
-                                "nickname": "回复者",
-                                "content": "楼中楼评论",
-                                "list_3": [],
-                            }
-                        ],
+                        "comment_id": "child-comment",
+                        "uin": 20003,
+                        "nickname": "回复者",
+                        "content": "楼中楼评论",
+                        "list_3": [],
                     }
                 ],
-            },
-        }
-
-    backend.get_qzone_user_feeds = get_user_feeds  # type: ignore[method-assign]
-    backend.comment_qzone = comment_qzone  # type: ignore[method-assign]
-    backend.get_qzone_msg_detail = get_qzone_msg_detail  # type: ignore[method-assign]
+            }
+        ],
+    }
+    _install_direct_client(monkeypatch, client)
     service.plugin.runtime.interaction_log.mark(
         "20001",
         "already-commented",
@@ -409,15 +470,23 @@ async def test_legacy_service_facade_filters_reads_and_uses_shared_state(
         },
     ]
     assert commented is True
-    assert backend.calls[-1] == (
-        "comment_qzone",
-        {
-            "tid": "feed-new",
-            "content": "原版评论",
-            "target_uin": 20001,
-            "images": None,
-        },
-    )
+    # 评论写入仍经 OneBot Expand 后端转发。
+    assert backend.calls == [
+        (
+            "comment_qzone",
+            {
+                "tid": "feed-new",
+                "content": "原版评论",
+                "target_uin": 20001,
+                "images": None,
+            },
+        )
+    ]
+    # 读取路径应走本地直连客户端。
+    assert [action for action, _ in client.calls] == [
+        "get_user_feeds",
+        "get_msg_detail",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2048,8 +2117,10 @@ async def test_generated_publish_tool_and_commands_use_existing_runtime(
 async def test_service_forwards_internal_user_feed_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """任意 QQ 读取应经内部无浏览器 QZone Service 完整转发参数。"""
+    """任意 QQ 读取应经本地直连客户端完整转发参数。"""
     _, service, backend = _build_runtime(monkeypatch)
+    client = FakeDirectClient()
+    _install_direct_client(monkeypatch, client)
 
     await service.get_qzone_user_feeds(
         host_uin=20001,
@@ -2058,17 +2129,18 @@ async def test_service_forwards_internal_user_feed_query(
         self_uin=10001,
     )
 
-    assert backend.calls == [
+    assert client.calls == [
         (
-            "get_qzone_user_feeds",
+            "get_user_feeds",
             {
                 "host_uin": 20001,
                 "pos": 2,
                 "num": 3,
-                "self_uin": 10001,
             },
         )
     ]
+    # 直连路径不应触达 OneBot Expand 后端。
+    assert backend.calls == []
 
 
 def test_rate_limit_error_detection() -> None:
@@ -2226,6 +2298,132 @@ async def test_poller_stops_batch_and_backs_off_on_rate_limit(
         "频率限制" in message and "本轮剩余候选全部跳过" in message
         for message in fake_logger.messages
     )
+
+
+@pytest.mark.asyncio
+async def test_poller_uses_short_backoff_for_generation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 生成失败应使用短退避且不阻断本轮剩余候选。
+
+    回归背景：LLM 网关 "Connection error." 曾按协议失败走 30 分钟起步的
+    指数退避，26 次失败后全部候选退避到 8 小时后，自动回复完全停滞。
+    """
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    QzoneReplyPoller = poller_module.QzoneReplyPoller
+    PollingState = state_module.PollingState
+
+    monkeypatch.setattr(
+        state_module.storage_api,
+        "save_json",
+        lambda *args, **kwargs: asyncio.sleep(0),
+    )
+
+    class FakePollingService:
+        """两条评论；生成阶段全部失败，发送阶段不应被触达。"""
+
+        async def get_qzone_msg_list(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "msglist": [
+                        {
+                            "tid": "own-post",
+                            "comment_num": 2,
+                            "commentlist": [],
+                        }
+                    ]
+                },
+            }
+
+        async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
+
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "commentlist": [
+                        {
+                            "comment_id": "comment-1",
+                            "uin": 20001,
+                            "nickname": "访客一",
+                            "content": "第一条",
+                            "list_3": [],
+                        },
+                        {
+                            "comment_id": "comment-2",
+                            "uin": 20002,
+                            "nickname": "访客二",
+                            "content": "第二条",
+                            "list_3": [],
+                        },
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("生成失败后不应进入发送阶段")
+
+    async def generate_reply(candidate: Any) -> str:
+        raise ConnectionError("Connection error.")
+
+    config = NeoFoxzoneConfig()
+    plugin = NeoFoxzonePlugin(config=config)
+    state = PollingState(max_entries=20)
+    poller = QzoneReplyPoller(
+        plugin,
+        service=FakePollingService(),
+        state=state,
+        reply_generator=generate_reply,
+        bot_uin_loader=lambda: asyncio.sleep(0, result=99999),
+    )
+
+    report = await poller.poll_once()
+
+    # 两条候选都应被尝试（生成失败不终止本轮），且都记录失败。
+    assert report.failed == 2
+    assert report.replied == 0
+    now = time.time()
+    for identity in (
+        "own_post:99999:own-post:comment-1",
+        "own_post:99999:own-post:comment-2",
+    ):
+        retry_after = state.retry_after(identity)
+        # 生成失败退避（默认 5 分钟）必须远小于普通失败退避（30 分钟起步）。
+        assert now < retry_after <= now + 6 * 60
+        assert state.is_in_flight(identity) is False
+
+
+def test_polling_state_expires_stale_in_flight_reservations() -> None:
+    """占用超过超时时间后应自动释放，允许候选重新处理。
+
+    回归背景：发送异常后候选被永久占用（in_flight 无超时释放），
+    后续每轮都被「上次发送结果不明」跳过。
+    """
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    PollingState = state_module.PollingState
+
+    state = PollingState()
+    state.in_flight_timeout_seconds = 3600.0
+    state.reserve("stale-comment")
+    assert state.is_in_flight("stale-comment") is True
+
+    # 模拟占用发生在超时时间之前。
+    state.in_flight_reserved_at["stale-comment"] = time.time() - 7200.0
+
+    assert state.is_in_flight("stale-comment") is False
+    assert "stale-comment" not in state.in_flight_comment_ids
+    assert "stale-comment" not in state.in_flight_reserved_at
 
 
 @pytest.mark.asyncio

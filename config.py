@@ -114,7 +114,15 @@ class NeoFoxzoneConfig(BaseConfig):
         )
         failure_retry_minutes: float = Field(
             default=30.0,
-            description="LLM 或协议明确失败后的基础重试间隔（分钟）。",
+            description="协议明确失败后的基础重试间隔（分钟）。",
+        )
+        generation_retry_minutes: float = Field(
+            default=5.0,
+            description=(
+                "LLM 生成失败（如网关连接错误）后的重试间隔（分钟）。"
+                "生成失败与 QZone 发送失败无关，短退避即可，避免一次网关抖动"
+                "让全部候选退避数小时。"
+            ),
         )
         rate_limit_retry_minutes: float = Field(
             default=120.0,

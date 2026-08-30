@@ -13,6 +13,13 @@ from .config import NeoFoxzoneConfig
 from .contracts import OneBotQzoneService
 from .core.llm.content_service import ContentService
 from .image_provider import ImageProviderError, generate_images
+from .qzone_client import (
+    QZoneClientError,
+    QZoneDirectClient,
+    QZoneRateLimitError,
+    fetch_qzone_cookie_string,
+    invalidate_qzone_cookie_cache,
+)
 
 QzoneResponse = dict[str, Any]
 VALID_UGC_RIGHTS = frozenset({1, 4, 16, 64, 128})
@@ -242,6 +249,42 @@ class NeoFoxzoneService(BaseService):
             return None
         return uin if uin > 0 else None
 
+    async def _with_direct_client(self, operation):
+        """在本地 QZone 直连客户端上执行操作，Cookie 失效时重试一次。
+
+        直连客户端按原版 FoxZone 2.0.2 的浏览器级请求实现
+        （``user.qzone.qq.com`` 域 Cookie + aiohttp 会话传输），
+        规避协议端兼容层触发 QZone 反爬（subcode=1012）的问题。
+        """
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                cookie_string = await fetch_qzone_cookie_string()
+            except QZoneClientError as error:
+                raise NeoFoxzoneError(str(error)) from error
+            client = QZoneDirectClient.create(cookie_string)
+            try:
+                return await operation(client)
+            except QZoneClientError as error:
+                last_error = error
+                if "-3000" in str(error) and attempt == 0:
+                    invalidate_qzone_cookie_cache()
+                    continue
+                raise NeoFoxzoneError(str(error)) from error
+        raise NeoFoxzoneError(str(last_error or "QZone 直连请求失败。"))
+
+    @staticmethod
+    def _direct_failure(error: Exception) -> QzoneResponse:
+        """把本地直连异常收敛为标准 OneBot 失败响应。"""
+        message = str(error) or "QZone 直连请求失败。"
+        return {
+            "status": "failed",
+            "retcode": -1,
+            "data": None,
+            "msg": message,
+            "wording": message,
+        }
+
     async def get_qzone_msg_list(
         self,
         pos: int = 0,
@@ -268,11 +311,25 @@ class NeoFoxzoneService(BaseService):
         tid: str,
         host_uin: int,
     ) -> QzoneResponse:
-        """获取单条说说详情及其可验证的完整评论树。"""
-        return await self._backend().get_qzone_msg_detail(
-            tid=self._validate_tid(tid),
-            host_uin=self._validate_user_id(host_uin, "host_uin"),
-        )
+        """获取单条说说详情及其可验证的完整评论树。
+
+        使用本地直连客户端（原版 FoxZone 浏览器级请求）读取
+        ``msgdetail_v6``，不再依赖协议端兼容层。
+        """
+
+        async def _operation(client: QZoneDirectClient) -> dict[str, Any]:
+            return await client.get_msg_detail(
+                self._validate_user_id(host_uin, "host_uin"),
+                self._validate_tid(tid),
+            )
+
+        try:
+            detail = await self._with_direct_client(_operation)
+        except (NeoFoxzoneError, QZoneRateLimitError) as error:
+            return self._direct_failure(error)
+        except (TypeError, ValueError) as error:
+            return self._direct_failure(error)
+        return {"status": "ok", "retcode": 0, "data": detail}
 
     async def get_qzone_user_feeds(
         self,
@@ -282,19 +339,31 @@ class NeoFoxzoneService(BaseService):
         num: int = 5,
         self_uin: int | None = None,
     ) -> QzoneResponse:
-        """经 OneBot Expand 内部兼容层读取指定 QQ 可见的说说列表。"""
+        """经本地直连客户端读取指定 QQ 可见的说说列表。"""
         self._validate_query(pos, num)
         normalized_self_uin = (
             self._validate_user_id(self_uin, "self_uin")
             if self_uin is not None
             else None
         )
-        return await self._backend().get_qzone_user_feeds(
-            host_uin=self._validate_user_id(host_uin, "host_uin"),
-            pos=pos,
-            num=num,
-            self_uin=normalized_self_uin,
-        )
+        del normalized_self_uin  # 直连客户端从 Cookie 自身识别 uin
+
+        async def _operation(client: QZoneDirectClient) -> dict[str, Any]:
+            return {
+                "msglist": await client.get_user_feeds(
+                    host_uin=self._validate_user_id(host_uin, "host_uin"),
+                    pos=pos,
+                    num=num,
+                )
+            }
+
+        try:
+            data = await self._with_direct_client(_operation)
+        except (NeoFoxzoneError, QZoneRateLimitError) as error:
+            return self._direct_failure(error)
+        except (TypeError, ValueError) as error:
+            return self._direct_failure(error)
+        return {"status": "ok", "retcode": 0, "data": data}
 
     async def send_qzone_msg(
         self,
@@ -438,15 +507,25 @@ class NeoFoxzoneService(BaseService):
             if self_uin is not None
             else None
         )
-        return await self._backend().reply_qzone_comment(
-            tid=self._validate_tid(tid),
-            host_uin=self._validate_user_id(host_uin, "host_uin"),
-            root_comment_id=normalized_root_comment_id,
-            target_uin=self._validate_user_id(target_uin, "target_uin"),
-            target_name=normalized_name,
-            content=normalized_content,
-            self_uin=normalized_self_uin,
-        )
+        del normalized_self_uin  # 直连客户端从 Cookie 自身识别操作者 uin
+
+        async def _operation(client: QZoneDirectClient) -> dict[str, Any]:
+            return await client.reply_comment(
+                host_uin=self._validate_user_id(host_uin, "host_uin"),
+                tid=self._validate_tid(tid),
+                root_comment_id=normalized_root_comment_id,
+                target_uin=self._validate_user_id(target_uin, "target_uin"),
+                target_name=normalized_name,
+                content=normalized_content,
+            )
+
+        try:
+            data = await self._with_direct_client(_operation)
+        except (NeoFoxzoneError, QZoneRateLimitError) as error:
+            return self._direct_failure(error)
+        except (TypeError, ValueError) as error:
+            return self._direct_failure(error)
+        return {"status": "ok", "retcode": 0, "data": data}
 
     async def publish_feed(
         self,
