@@ -89,6 +89,8 @@ class PollingState:
     retry_after_by_identity: dict[str, float] = field(default_factory=dict)
     failure_counts_by_identity: dict[str, int] = field(default_factory=dict)
     last_attempted_identity: str = ""
+    #: 全局限流冷却截止时间戳（Unix 秒）；期间不再发起详情补全与发送。
+    rate_limit_cooldown_until: float = 0.0
 
     @classmethod
     async def load(cls, max_entries: int = 2000) -> "PollingState":
@@ -129,6 +131,12 @@ class PollingState:
         state.last_attempted_identity = str(
             payload.get("last_attempted_identity") or ""
         ).strip()
+        try:
+            state.rate_limit_cooldown_until = max(
+                0.0, float(payload.get("rate_limit_cooldown_until") or 0.0)
+            )
+        except (TypeError, ValueError):
+            state.rate_limit_cooldown_until = 0.0
         state._trim()
         return state
 
@@ -202,6 +210,16 @@ class PollingState:
         normalized = str(identity).strip()
         self.failure_counts_by_identity.pop(normalized, None)
         self.retry_after_by_identity.pop(normalized, None)
+
+    def record_rate_limit_cooldown(self, until: float) -> None:
+        """记录全局限流冷却截止时间（取更晚看，不缩短已有冷却）。"""
+        self.rate_limit_cooldown_until = max(
+            self.rate_limit_cooldown_until, max(0.0, float(until))
+        )
+
+    def rate_limit_cooldown_active(self) -> bool:
+        """查询当前是否仍处于限流冷却窗口内。"""
+        return time.time() < self.rate_limit_cooldown_until
 
     def retry_after(self, identity: str) -> float:
         """返回评论下一次允许重试的 Unix 时间戳。"""
@@ -345,6 +363,7 @@ class PollingState:
                     self.failure_counts_by_identity
                 ),
                 "last_attempted_identity": self.last_attempted_identity,
+                "rate_limit_cooldown_until": self.rate_limit_cooldown_until,
             },
         )
 

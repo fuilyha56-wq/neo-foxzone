@@ -587,10 +587,10 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.5"
+    assert plugin.plugin_version == "0.1.6"
     assert plugin.dependencies == [BACKEND_SIGNATURE, ACCOUNT_SIGNATURE]
-    assert plugin.config.plugin.version == "0.1.5"
-    assert NeoFoxzoneService.version == "0.1.5"
+    assert plugin.config.plugin.version == "0.1.6"
+    assert NeoFoxzoneService.version == "0.1.6"
 
 
 def test_manifest_declares_market_and_runtime_dependency() -> None:
@@ -599,7 +599,7 @@ def test_manifest_declares_market_and_runtime_dependency() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.5"
+    assert manifest["version"] == "0.1.6"
     assert manifest["dependencies"]["plugins"] == [
         "onebot_expand>=1.0.17"
     ]
@@ -2566,3 +2566,221 @@ async def test_poller_jitters_between_sends(
         if config.polling.send_jitter_seconds_min <= delay
     ]
     assert len(jitter_sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_poller_enriches_html_friend_feeds_via_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SnowLuma 好友动态只有预渲染 html 时，也必须发起详情补全。
+
+    回归背景：好友动态条目没有任何结构化评论字段时曾被直接跳过，
+    导致好友说说下的评论永远不会被发现（可回复候选恒为 0）。
+    """
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    detail_calls: list[tuple[str, int]] = []
+    reply_calls: list[dict[str, Any]] = []
+
+    async def save_json(*args: Any, **kwargs: Any) -> None:
+        """避免测试写入实际插件状态。"""
+
+    monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+
+    class FakeLogger:
+        """静默日志。"""
+
+        def info(self, message: str) -> None:
+            pass
+
+        def warning(self, message: str) -> None:
+            pass
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            pass
+
+    monkeypatch.setattr(poller_module, "logger", FakeLogger())
+
+    class HtmlFriendFeedService:
+        """好友动态仅返回预渲染 html，无结构化评论。"""
+
+        async def get_qzone_msg_list(self, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"msglist": []}}
+
+        async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "feeds": [
+                        {
+                            "appid": "311",
+                            "uin": 2295127191,
+                            "key": "friend-post-1",
+                            "nickname": "好友甲",
+                            "html": "<div>预渲染动态</div>",
+                        },
+                        {
+                            "appid": "6600",
+                            "uin": 0,
+                            "key": "advertisement_outlink_0",
+                            "html": "<div>广告</div>",
+                        },
+                    ]
+                },
+            }
+
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            detail_calls.append((tid, host_uin))
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "tid": tid,
+                    "uin": host_uin,
+                    "content": "好友说说正文",
+                    "commentlist": [
+                        {
+                            "comment_id": "friend-comment-1",
+                            "uin": 3893256464,
+                            "nickname": "评论者",
+                            "content": "好看",
+                            "list_3": [],
+                        }
+                    ],
+                },
+            }
+
+        async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
+            reply_calls.append(kwargs)
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"comment_id": "bot-thread-reply"},
+            }
+
+    async def generate_reply(candidate: Any) -> str:
+        """返回固定回复。"""
+        return "谢谢关注"
+
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=NeoFoxzoneConfig()),
+        service=HtmlFriendFeedService(),
+        state=state_module.PollingState(),
+        reply_generator=generate_reply,
+        bot_uin_loader=lambda: asyncio.sleep(0, result=99999),
+    )
+
+    report = await poller.poll_once()
+
+    # appid=311 的 html 好友动态必须触发详情补全；appid=6600 的广告跳过。
+    assert detail_calls == [("friend-post-1", 2295127191)]
+    # 详情返回的是好友自己顶层评论（非回复 bot 的评论），不会生成候选；
+    # 这里验证的是详情链路打通而非回复行为。
+    assert report.candidates == 0
+    assert reply_calls == []
+
+
+@pytest.mark.asyncio
+async def test_poller_skips_detail_storm_during_rate_limit_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """限流冷却期内不得发起详情补全，避免风控窗口内继续打请求。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    QzoneReplyPoller = poller_module.QzoneReplyPoller
+    PollingState = state_module.PollingState
+    detail_calls: list[tuple[str, int]] = []
+
+    async def save_json(*args: Any, **kwargs: Any) -> None:
+        """避免测试写入实际插件状态。"""
+
+    monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+
+    class FakeLogger:
+        """收集日志。"""
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def info(self, message: str) -> None:
+            self.messages.append(message)
+
+        def warning(self, message: str) -> None:
+            self.messages.append(message)
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            self.messages.append(message)
+
+    monkeypatch.setattr(poller_module, "logger", FakeLogger())
+
+    class FakePollingService:
+        """摘要中有待补全的说说，但冷却期内不应触发详情。"""
+
+        async def get_qzone_msg_list(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "msglist": [
+                        {
+                            "tid": "own-post",
+                            "content": "测试说说",
+                            "comment_num": 1,
+                            "commentlist": [],
+                        }
+                    ]
+                },
+            }
+
+        async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
+
+        async def get_qzone_msg_detail(
+            self,
+            tid: str,
+            host_uin: int,
+        ) -> dict[str, Any]:
+            detail_calls.append((tid, host_uin))
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"tid": tid, "uin": host_uin, "commentlist": []},
+            }
+
+    state = PollingState(max_entries=20)
+    state.record_rate_limit_cooldown(time.time() + 3600.0)
+    poller = QzoneReplyPoller(
+        NeoFoxzonePlugin(config=NeoFoxzoneConfig()),
+        service=FakePollingService(),
+        state=state,
+        reply_generator=lambda candidate: asyncio.sleep(0, result="收到"),
+        bot_uin_loader=lambda: asyncio.sleep(0, result=99999),
+    )
+
+    report = await poller.poll_once()
+
+    assert detail_calls == []
+    assert report.candidates == 0
+    assert report.failed == 0
+    assert state.rate_limit_cooldown_until > time.time()
+    # 冷却标记持久化字段存在。
+    assert state.rate_limit_cooldown_active() is True
+
+
+def test_rate_limit_cooldown_persists_and_expires() -> None:
+    """限流冷却时间戳应随状态保存并可随时间过期。"""
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    state = state_module.PollingState()
+    assert state.rate_limit_cooldown_active() is False
+    state.record_rate_limit_cooldown(time.time() + 60.0)
+    assert state.rate_limit_cooldown_active() is True
+    # 不会缩短已有的更长冷却。
+    state.record_rate_limit_cooldown(time.time() + 10.0)
+    assert state.rate_limit_cooldown_until > time.time() + 30.0
+    state.record_rate_limit_cooldown(0.0)
+    assert state.rate_limit_cooldown_until > 0

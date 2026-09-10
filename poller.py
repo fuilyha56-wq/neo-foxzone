@@ -336,6 +336,13 @@ class QzoneReplyPoller:
         get_detail = getattr(self.service, "get_qzone_msg_detail", None)
         if get_detail is None or not callable(get_detail):
             return [], 0
+        # 限流退避未到期时不再发起详情风暴，让风控窗口先恢复。
+        if self.state.rate_limit_cooldown_active():
+            logger.info(
+                f"{ '自身说说' if source == 'own_post' else '好友动态' }"
+                "决策=限流冷却中，本轮跳过详情补全，仅使用摘要数据。"
+            )
+            return [], 0
 
         candidates: list[ReplyCandidate] = []
         attempts = 0
@@ -363,16 +370,24 @@ class QzoneReplyPoller:
                 host_uin = self._post_owner_uin(post)
                 if host_uin <= 0:
                     continue
+                if host_uin == bot_uin:
+                    continue
                 post_key = PollingState.post_key(post_id, host_uin)
                 if (
                     _structured_comment_count([post]) <= 0
                     and not known_bot_comments.get(post_key)
+                    and not str(post.get("html") or "").strip()
                 ):
+                    # SnowLuma 的好友动态只有预渲染 html，没有任何结构化评论；
+                    # 此时详情补全是发现评论的唯一途径，必须照常发起。
                     continue
 
             attempts += 1
             if attempts > 1 and detail_interval > 0:
-                await asyncio.sleep(detail_interval)
+                # 随机抖动避免固定节奏被风控识别；对齐原版 foxzone 的 3-8s 详情间隔。
+                await asyncio.sleep(
+                    random.uniform(detail_interval, detail_interval * 2)
+                )
             try:
                 detail_response = await get_detail(post_id, host_uin)
             except Exception as error:
@@ -682,6 +697,15 @@ class QzoneReplyPoller:
                 generation_failed=generation_failed,
             ),
         )
+        if rate_limited:
+            # 全局冷却：下轮不再发起详情补全，也不发送，让风控窗口先恢复。
+            self.state.record_rate_limit_cooldown(
+                time.time()
+                + max(
+                    60.0,
+                    float(self._config().polling.rate_limit_retry_minutes) * 60.0,
+                )
+            )
         report.failed += 1
         report.reply_errors.append(f"{identity}: {error}")
         if rate_limited:
@@ -729,6 +753,16 @@ class QzoneReplyPoller:
                 return report
 
             logger.info(f"自动回复身份确认完成: Bot QQ={_mask_uin(bot_uin)}。")
+
+            if self.state.rate_limit_cooldown_active():
+                cooldown_until = time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime(self.state.rate_limit_cooldown_until),
+                )
+                logger.warning(
+                    f"Neo FoxZone 限流冷却中: 截止={cooldown_until}；"
+                    "决策=本轮跳过详情补全与发送，仅汇总摘要数据。"
+                )
 
             candidates = self._rotate_candidates(
                 await self._query_candidates(bot_uin, report)
