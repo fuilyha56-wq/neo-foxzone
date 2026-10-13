@@ -2,11 +2,62 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 
+@dataclass(frozen=True, slots=True)
+class TextSegment:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ImageSegment:
+    image: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmojiSegment:
+    """Unicode Emoji text; numeric protocol-specific IDs are not portable."""
+
+    code: str | int
+
+
+@dataclass(frozen=True, slots=True)
+class FaceSegment:
+    face_id: str | int
+
+
+@dataclass(frozen=True, slots=True)
+class RawSegment:
+    type: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedComment:
+    comment_id: str
+    root_comment_id: str | None
+    parent_comment_id: str | None
+    author_qq: str | None
+    author_name: str
+    content: str
+    children: list["NormalizedComment"] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedPost:
+    post_id: str
+    owner_qq: str
+    content: str
+    images: list[str] = field(default_factory=list)
+    comments: list[NormalizedComment] = field(default_factory=list)
+    liked: bool | None = None
+    visibility: int | None = None
+
+
 class OneBotQzoneService(Protocol):
-    """OneBot Expand QQ 空间 Service 的最小稳定接口。"""
+    """运行时发现的 QZone Service 最小接口，不要求特定插件实现。"""
 
     async def get_qzone_msg_list(
         self,
@@ -128,4 +179,14 @@ class ExternalImageService(Protocol):
         ...
 
 
-__all__ = ["ExternalImageService", "OneBotQzoneService"]
+__all__ = [
+    "EmojiSegment",
+    "ExternalImageService",
+    "FaceSegment",
+    "ImageSegment",
+    "NormalizedComment",
+    "NormalizedPost",
+    "OneBotQzoneService",
+    "RawSegment",
+    "TextSegment",
+]

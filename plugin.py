@@ -11,11 +11,7 @@ from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 
-from . import (
-    ACCOUNT_SERVICE_SIGNATURE,
-    BACKEND_SERVICE_SIGNATURE,
-    SERVICE_SIGNATURE,
-)
+from . import SERVICE_SIGNATURE
 from .commands import NeoFoxzoneCommand
 from .config import NeoFoxzoneConfig
 from .autopilot.engine import AutonomousEngine, AutonomousScheduler
@@ -37,16 +33,20 @@ def _interval_label(interval_seconds: float) -> str:
 
 @register_plugin
 class NeoFoxzonePlugin(BasePlugin):
-    """装配基于 OneBot Expand 的 QQ 空间说说能力。"""
+    """装配可选协议端上的 QQ 空间说说能力。"""
 
     plugin_name = "neo-foxzone"
-    plugin_description = "基于 OneBot Expand 的 QQ 空间说说全功能插件"
+    plugin_description = "自动发现兼容 QZone Service 或 OneBot Adapter 的 QQ 空间插件"
     plugin_version = "0.1.6"
     configs = [NeoFoxzoneConfig]
-    dependencies = [BACKEND_SERVICE_SIGNATURE, ACCOUNT_SERVICE_SIGNATURE]
+    # 协议端在运行时发现，缺少 OneBot Expand 不阻止插件注册。
+    dependencies: list[str] = []
 
     def __init__(self, config: NeoFoxzoneConfig | None = None) -> None:
         """初始化共享运行时和轮询任务引用。"""
+        # 核心热重载保留配置缓存；旧模块的模型实例应按当前模型重新验证。
+        if config is not None and not isinstance(config, NeoFoxzoneConfig):
+            config = NeoFoxzoneConfig.model_validate(config.model_dump())
         super().__init__(config)
         state_max_entries = max(1, int(self._config().polling.state_max_entries))
         self.runtime = NeoFoxzoneRuntime(

@@ -46,6 +46,20 @@ class NeoFoxzoneConfig(BaseConfig):
 
     components: ComponentsSection = Field(default_factory=ComponentsSection)
 
+    @config_section("security", title="写操作账号校验", tag="security")
+    class SecuritySection(SectionBase):
+        """限制真实写操作必须使用明确配置的当前 Bot 账号。"""
+
+        write_account_qq: str = Field(
+            default="3693525299",
+            description=(
+                "真实写操作允许使用的 Bot QQ。每次发布、评论、点赞、删除、"
+                "权限和黑名单操作都会通过当前登录接口确认；未知或不匹配时拒绝。"
+            ),
+        )
+
+    security: SecuritySection = Field(default_factory=SecuritySection)
+
     @config_section("image", title="说说配图", tag="ai")
     class ImageSection(SectionBase):
         """可替换的图片生成 Service 配置。"""
@@ -76,6 +90,10 @@ class NeoFoxzoneConfig(BaseConfig):
         timeout_seconds: float = Field(
             default=180.0,
             description="等待图片 Provider 完成生成的超时时间（秒）。",
+        )
+        auto_decision_enabled: bool = Field(
+            default=False,
+            description="启用主题发布时由 LLM 选择是否配图、画面描述和 photo/drawing 风格。",
         )
 
     image: ImageSection = Field(default_factory=ImageSection)
@@ -204,6 +222,18 @@ class NeoFoxzoneConfig(BaseConfig):
         max_images: int = Field(
             default=9,
             description="单条说说或评论允许携带的最大图片数。",
+        )
+        max_image_bytes: int = Field(
+            default=10 * 1024 * 1024,
+            description="单张本地或 Base64 图片的最大字节数。",
+        )
+        max_content_chars: int = Field(
+            default=2000,
+            description="单条说说或评论正文的最大字符数。",
+        )
+        write_min_interval_seconds: float = Field(
+            default=2.0,
+            description="相邻真实写操作的最小间隔（秒）。",
         )
         max_command_output_chars: int = Field(
             default=12000,

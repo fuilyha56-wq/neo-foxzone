@@ -25,8 +25,9 @@ from typing import Any
 
 import aiohttp
 
-from src.app.plugin_system.api.adapter_api import send_adapter_command
 from src.kernel.logger import get_logger
+
+from .providers import get_adapter_cookie_string
 
 __all__ = [
     "QZONE_REPLY_URL",
@@ -63,9 +64,6 @@ QZONE_REPLY_URL = (
 
 #: 与浏览器一致的 Cookie 请求域名（原版 FoxZone 固定值）。
 QZONE_COOKIE_DOMAIN = "user.qzone.qq.com"
-
-#: OneBot 适配器签名（与 onebot_expand.api_defs 一致）。
-ADAPTER_SIGNATURE = "onebot_adapter:adapter:onebot_adapter"
 
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -587,45 +585,41 @@ class QZoneDirectClient:
 #: Cookie 获取的并发去重锁（模块级，Service 每次构造新实例）。
 _COOKIE_FETCH_LOCK = asyncio.Lock()
 #: 类级共享 Cookie 缓存 ``(cookie 字符串, 到期时间戳)``。
-_SHARED_COOKIE_CACHE: tuple[str, float] | None = None
+_SHARED_COOKIE_CACHE: dict[str, tuple[str, float]] = {}
 _COOKIE_CACHE_TTL_SECONDS = 300.0
 
 
-async def fetch_qzone_cookie_string() -> str:
-    """经 onebot_adapter 透传 ``get_cookies`` 获取 QZone Cookie。
+async def fetch_qzone_cookie_string(expected_qq: int | str | None = None) -> str:
+    """从实时账号匹配的在线 Adapter 获取 QZone Cookie。
 
     使用 ``user.qzone.qq.com`` 域名（与浏览器一致）；带 TTL 共享缓存
-    与并发去重，避免一轮轮询内重复触发协议端风控。
+    与并发去重，避免一轮轮询内重复触发协议端风控。多账号环境必须明确
+    目标 QQ，避免把另一个登录账号的 Cookie 用到当前请求。
     """
     global _SHARED_COOKIE_CACHE
+    account_key = str(expected_qq).strip() if expected_qq is not None else "<unique>"
     async with _COOKIE_FETCH_LOCK:
         now = time.monotonic()
-        if _SHARED_COOKIE_CACHE is not None:
-            cookie_string, expires_at = _SHARED_COOKIE_CACHE
+        cached = _SHARED_COOKIE_CACHE.get(account_key)
+        if cached is not None:
+            cookie_string, expires_at = cached
             if now < expires_at:
                 return cookie_string
-        response = await send_adapter_command(
-            adapter_sign=ADAPTER_SIGNATURE,
-            command_name="get_cookies",
-            command_data={"domain": QZONE_COOKIE_DOMAIN},
-            timeout=15.0,
-        )
-        if str(response.get("status", "")).lower() != "ok":
-            message = str(
-                response.get("msg")
-                or response.get("wording")
-                or "协议端未返回 QZone Cookie。"
+        try:
+            cookies = await get_adapter_cookie_string(
+                domain=QZONE_COOKIE_DOMAIN,
+                expected_qq=account_key if expected_qq is not None else None,
             )
-            raise QZoneClientError(message)
-        data = response.get("data")
-        cookies = data.get("cookies") if isinstance(data, dict) else None
-        if not isinstance(cookies, str) or not cookies.strip():
-            raise QZoneClientError("协议端返回的 QZone Cookie 为空。")
-        _SHARED_COOKIE_CACHE = (cookies, now + _COOKIE_CACHE_TTL_SECONDS)
+        except Exception as error:
+            raise QZoneClientError(str(error) or "协议端未返回 QZone Cookie。") from error
+        _SHARED_COOKIE_CACHE[account_key] = (
+            cookies,
+            now + _COOKIE_CACHE_TTL_SECONDS,
+        )
         return cookies
 
 
 def invalidate_qzone_cookie_cache() -> None:
     """清除共享 Cookie 缓存（Cookie 失效时调用）。"""
     global _SHARED_COOKIE_CACHE
-    _SHARED_COOKIE_CACHE = None
+    _SHARED_COOKIE_CACHE.clear()

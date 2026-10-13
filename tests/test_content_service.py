@@ -79,3 +79,61 @@ async def test_content_service_invalid_decision_is_empty(monkeypatch: pytest.Mon
     service = ContentService(NeoFoxzoneConfig())
 
     assert await service.generate_feed_decisions([{"content": "one"}]) == []
+
+
+@pytest.mark.asyncio
+async def test_story_decision_accepts_only_bounded_image_choices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Structured image decisions keep bounded text and a known style."""
+    request = _FakeRequest(
+        '{"content":"hello","generate_image":true,'
+        '"image_description":"forest","image_style":"photo"}'
+    )
+    monkeypatch.setattr(content_module.llm_api, "get_model_set_by_task", lambda name: object())
+    monkeypatch.setattr(
+        content_module.llm_api,
+        "create_llm_request",
+        lambda **kwargs: request,
+    )
+    service = ContentService(NeoFoxzoneConfig())
+
+    result = await service.generate_story_decision("topic")
+
+    assert result == {
+        "content": "hello",
+        "generate_image": True,
+        "image_description": "forest",
+        "image_style": "photo",
+    }
+
+
+@pytest.mark.asyncio
+async def test_story_decision_parse_failure_cancels_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed model output must not publish the input topic as fake generation."""
+    request = _FakeRequest("not-json")
+    monkeypatch.setattr(content_module.llm_api, "get_model_set_by_task", lambda name: object())
+    monkeypatch.setattr(
+        content_module.llm_api,
+        "create_llm_request",
+        lambda **kwargs: request,
+    )
+    service = ContentService(NeoFoxzoneConfig())
+
+    with pytest.raises(ValueError, match="JSON"):
+        await service.generate_story_decision("safe topic")
+
+
+@pytest.mark.asyncio
+async def test_story_generation_failure_does_not_echo_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider failure remains a failure rather than authorizing a post."""
+    service = ContentService(NeoFoxzoneConfig())
+
+    async def failed_request(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("429 rate limited")
+
+    monkeypatch.setattr(service, "_request", failed_request)
+    with pytest.raises(RuntimeError, match="429"):
+        await service.generate_story("must not publish this topic")

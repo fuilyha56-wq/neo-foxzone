@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import json
 import time
@@ -20,6 +21,7 @@ plugin_module = importlib.import_module(f"{PACKAGE}.plugin")
 service_module = importlib.import_module(f"{PACKAGE}.service")
 tools_module = importlib.import_module(f"{PACKAGE}.tools")
 image_provider_module = importlib.import_module(f"{PACKAGE}.image_provider")
+providers_module = importlib.import_module(f"{PACKAGE}.providers")
 
 BACKEND_SIGNATURE = constants.BACKEND_SERVICE_SIGNATURE
 ACCOUNT_SIGNATURE = "onebot_expand:service:account_service"
@@ -31,6 +33,33 @@ NeoFoxzoneError = service_module.NeoFoxzoneError
 NeoFoxzoneService = service_module.NeoFoxzoneService
 ImageProviderError = image_provider_module.ImageProviderError
 normalize_image_result = image_provider_module.normalize_image_result
+
+
+@pytest.mark.asyncio
+async def test_direct_read_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class ReadService:
+        async def get_qzone_user_feeds(self, **kwargs: Any):
+            calls.append(("list", kwargs))
+            return {"status": "ok"}
+
+        async def get_qzone_msg_detail(self, **kwargs: Any):
+            calls.append(("detail", kwargs))
+            return {"status": "ok"}
+
+    async def run(self, operation, message):
+        return (await operation)["status"] == "ok", message
+
+    monkeypatch.setattr(NeoFoxzoneCommand, "_service", lambda self: ReadService())
+    monkeypatch.setattr(NeoFoxzoneCommand, "_run", run)
+    command = object.__new__(NeoFoxzoneCommand)
+    assert (await command.handle_user_posts(12345, 2, 3))[0]
+    assert (await command.handle_detail("post-id", 12345))[0]
+    assert calls == [
+        ("list", {"host_uin": 12345, "pos": 2, "num": 3}),
+        ("detail", {"tid": "post-id", "host_uin": 12345}),
+    ]
 
 
 class FakeQzoneBackend:
@@ -193,19 +222,49 @@ def _build_runtime(
 ) -> tuple[Any, Any, FakeQzoneBackend]:
     """创建插件、Service 和可解析两个签名的替身运行时。"""
     config = NeoFoxzoneConfig()
+    config.limits.write_min_interval_seconds = 0
     plugin = NeoFoxzonePlugin(config=config)
     service = NeoFoxzoneService(plugin)
     backend = FakeQzoneBackend()
 
-    def get_service(signature: str) -> object | None:
-        """按组件签名返回测试实例。"""
-        if signature == SERVICE_SIGNATURE:
-            return service
-        if signature == BACKEND_SIGNATURE:
-            return backend
-        return None
+    async def confirmed_login(*, expected_qq: str | None = None) -> dict[str, Any]:
+        """返回由测试模拟的实时登录接口确认结果。"""
+        return {"status": "confirmed", "qq": expected_qq or "3693525299"}
 
-    monkeypatch.setattr(service_module.service_api, "get_service", get_service)
+    async def verified_detail(tid: str, owner_uin: int) -> dict[str, Any]:
+        """返回测试用显式作者和顶层评论详情。"""
+        return {
+            "tid": tid,
+            "uin": owner_uin,
+            "commentlist": [
+                {"comment_id": "global-root-comment-id", "uin": 10003, "list_3": []}
+            ],
+        }
+
+    async def fake_download_remote_image(url: str, maximum_bytes: int) -> str:
+        """返回小型 PNG 替身，避免契约测试发起外网请求。"""
+        del url
+        image_bytes = b"\x89PNG\r\n\x1a\n"
+        assert len(image_bytes) <= maximum_bytes
+        return "base64://" + base64.b64encode(image_bytes).decode("ascii")
+
+    monkeypatch.setattr(service_module, "get_current_login_info", confirmed_login)
+    monkeypatch.setattr(service, "_verified_post_detail", verified_detail)
+    monkeypatch.setattr(service, "_download_remote_image", fake_download_remote_image)
+    monkeypatch.setattr(
+        tools_module.service_api,
+        "get_service",
+        lambda signature: service if signature == SERVICE_SIGNATURE else None,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "discover_qzone_provider",
+        lambda refresh=False: type(
+            "Snapshot",
+            (),
+            {"provider": backend, "diagnostic": "test provider", "source": BACKEND_SIGNATURE},
+        )(),
+    )
     return plugin, service, backend
 
 
@@ -269,8 +328,9 @@ def _install_direct_client(
 ) -> None:
     """把 Service 模块的直连依赖替换为测试替身。"""
 
-    async def fake_fetch_cookie() -> str:
+    async def fake_fetch_cookie(expected_qq: int | str | None = None) -> str:
         """返回可解析出 p_skey 与 uin 的假 Cookie。"""
+        del expected_qq
         return "p_skey=fake-skey; uin=o12345"
 
     class FakeDirectClientFactory:
@@ -293,6 +353,7 @@ def _install_direct_client(
 @pytest.mark.asyncio
 async def test_service_forwards_all_nine_qzone_actions(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Service 应完整转发 OneBot Expand 暴露的九个 QZone action。"""
     _, service, backend = _build_runtime(monkeypatch)
@@ -305,14 +366,20 @@ async def test_service_forwards_all_nine_qzone_actions(
         ugc_right=16,
         target_uins=[10001, 10001, 10002],
     )
-    await service.delete_qzone_msg(tid=" tid-1 ")
+    await service.delete_qzone_msg(
+        tid=" tid-1 ",
+        expected_author_qq=3693525299,
+        confirmation="DELETE tid-1 3693525299 3693525299",
+    )
     await service.like_qzone(tid="tid-2", target_uin=20001)
     await service.unlike_qzone(tid="tid-3", target_uin=20002)
+    local_image = tmp_path / "comment.png"
+    local_image.write_bytes(b"\x89PNG\r\n\x1a\n")
     await service.comment_qzone(
         tid="tid-4",
         content="带图评论",
         target_uin=20003,
-        images=["file:///tmp/comment.png"],
+        images=[local_image.as_uri()],
     )
     await service.set_qzone_ban(user_id=30001, enable=False)
     await service.set_qzone_msg_right(
@@ -334,7 +401,7 @@ async def test_service_forwards_all_nine_qzone_actions(
     ]
     assert backend.calls[2][1] == {
         "content": "带图说说",
-        "images": ["https://example.test/a.jpg"],
+        "images": ["base64://iVBORw0KGgo="],
         "ugc_right": 16,
         "target_uins": [10001, 10002],
     }
@@ -526,9 +593,21 @@ async def test_missing_backend_reports_required_dependency(
     """前置 Service 缺失时应给出可操作错误。"""
     plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
     service = NeoFoxzoneService(plugin)
-    monkeypatch.setattr(service_module.service_api, "get_service", lambda _: None)
+    monkeypatch.setattr(
+        service_module,
+        "discover_qzone_provider",
+        lambda refresh=False: type(
+            "Snapshot",
+            (),
+            {
+                "provider": None,
+                "diagnostic": "未发现任何协议端能力。",
+                "source": None,
+            },
+        )(),
+    )
 
-    with pytest.raises(NeoFoxzoneError, match="OneBot Expand"):
+    with pytest.raises(NeoFoxzoneError, match="当前协议端不可用"):
         await service.get_qzone_msg_list()
 
 
@@ -561,7 +640,7 @@ async def test_tools_and_command_use_plugin_service(
     )
 
 
-def test_plugin_registers_service_command_and_ten_tools() -> None:
+def test_plugin_registers_service_command_and_tools() -> None:
     """默认配置应注册基础能力、AI 生图发布入口和原版 Tool 名。"""
     plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
     names = [component.name for component in plugin.get_components()]
@@ -571,6 +650,7 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         "neo-foxzone",
         "neo_foxzone_list_posts",
         "neo_foxzone_list_feeds",
+        "neo_foxzone_read_detail",
         "qzone_read_feed",
         "neo_foxzone_publish",
         "neo_foxzone_publish_generated",
@@ -578,6 +658,7 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         "neo_foxzone_like",
         "neo_foxzone_unlike",
         "neo_foxzone_comment",
+        "neo_foxzone_reply_comment",
         "neo_foxzone_set_blacklist",
         "neo_foxzone_set_visibility",
         "qzone_post_comment",
@@ -588,27 +669,256 @@ def test_plugin_registers_service_command_and_ten_tools() -> None:
         for component in plugin.get_components()[1:]
     )
     assert plugin.plugin_version == "0.1.6"
-    assert plugin.dependencies == [BACKEND_SIGNATURE, ACCOUNT_SIGNATURE]
+    assert plugin.dependencies == []
     assert plugin.config.plugin.version == "0.1.6"
+
+
+def test_plugin_revalidates_cached_config_after_module_reload() -> None:
+    """A previous module's config class must retain settings after hot reload."""
+    config = NeoFoxzoneConfig()
+    config.plugin.enabled = False
+    config.polling.enabled = False
+    config.security.write_account_qq = "10003"
+
+    class CachedConfig:
+        def model_dump(self) -> dict[str, Any]:
+            return config.model_dump()
+
+    plugin = NeoFoxzonePlugin(config=CachedConfig())  # type: ignore[arg-type]
+    assert isinstance(plugin.config, NeoFoxzoneConfig)
+    assert plugin.config.security.write_account_qq == "10003"
+    assert plugin.config.polling.enabled is False
+    assert plugin.get_components() == []
     assert NeoFoxzoneService.version == "0.1.6"
 
 
-def test_manifest_declares_market_and_runtime_dependency() -> None:
-    """Manifest 应同时声明插件级依赖与组件级依赖。"""
+def test_manifest_keeps_protocol_plugins_optional() -> None:
+    """缺少 OneBot Expand 时插件清单仍允许其加载。"""
     manifest_path = Path(__file__).parents[1] / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
     assert manifest["version"] == "0.1.6"
-    assert manifest["dependencies"]["plugins"] == [
-        "onebot_expand>=1.0.17"
+    assert manifest["dependencies"]["plugins"] == []
+    assert manifest["dependencies"]["components"] == []
+    assert manifest["dependencies_required"] is False
+    assert len(manifest["include"]) == 15
+
+
+@pytest.mark.asyncio
+async def test_write_is_blocked_when_login_account_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未知登录账号时绝不调用写接口。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    async def unknown_login(*, expected_qq: str | None = None) -> dict[str, Any]:
+        del expected_qq
+        return {"status": "unknown", "qq": None, "message": "实时接口不可用。"}
+
+    monkeypatch.setattr(service_module, "get_current_login_info", unknown_login)
+    with pytest.raises(NeoFoxzoneError, match="已阻止真实写操作"):
+        await service.send_qzone_msg(content="must not be sent")
+    assert backend.calls == []
+
+
+def test_content_normalization_blocks_cq_injection_and_caps_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """写接口正文统一清理 CQ 标记、HTML 边界与超长输入。"""
+    _, service, _ = _build_runtime(monkeypatch)
+
+    normalized = service._normalize_content(" <b>[CQ:at,qq=1]</b>\x00 ", "正文")
+
+    assert normalized == "&lt;b&gt;［CQ:at,qq=1]&lt;/b&gt;"
+    service._config().limits.max_content_chars = 5
+    with pytest.raises(NeoFoxzoneError, match="不能超过 5 个字符"):
+        service._normalize_content("123456", "正文")
+
+
+@pytest.mark.asyncio
+async def test_image_normalization_rejects_private_and_local_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """图片引用不能将协议端导向回环、内网或云元数据地址。"""
+    _, service, _ = _build_runtime(monkeypatch)
+
+    for image in (
+        "http://127.0.0.1/private.png",
+        "http://192.168.1.20/image.png",
+        "http://metadata.google.internal/latest/meta-data/",
+        "file://server/share/image.png",
+    ):
+        with pytest.raises(NeoFoxzoneError):
+            await service._normalize_images([image])
+
+
+@pytest.mark.asyncio
+async def test_image_dns_resolver_rejects_private_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """域名即使名称看似公开，DNS 返回私网地址时也会拒绝。"""
+    resolver = service_module._PublicImageResolver()
+
+    async def private_resolution(host: str, port: int, family: int):
+        del host, port, family
+        return [{"host": "127.0.0.1"}]
+
+    monkeypatch.setattr(resolver._resolver, "resolve", private_resolution)
+    try:
+        with pytest.raises(OSError, match="非公网地址"):
+            await resolver.resolve("public.example")
+    finally:
+        await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_uses_normalized_body_before_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """发布调用转发前会执行统一正文安全处理。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    await service.send_qzone_msg(content=" [CQ:face,id=1] <b>hi</b> ")
+
+    assert backend.calls[0][1]["content"] == "［CQ:face,id=1] &lt;b&gt;hi&lt;/b&gt;"
+
+
+@pytest.mark.asyncio
+async def test_manual_writes_obey_minimum_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """相邻写操作会遵守可配置的最小发送间隔。"""
+    _, service, _ = _build_runtime(monkeypatch)
+    service._config().limits.write_min_interval_seconds = 0.02
+    await service._respect_write_rate_limit()
+    started = time.monotonic()
+
+    await service._respect_write_rate_limit()
+
+    assert time.monotonic() - started >= 0.015
+
+
+@pytest.mark.asyncio
+async def test_delete_requires_confirmed_own_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """目标作者不是当前账号时，即使确认串格式正确也禁止删除。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    async def foreign_post(tid: str, owner_uin: int) -> dict[str, Any]:
+        return {"tid": tid, "uin": owner_uin + 1, "commentlist": []}
+
+    monkeypatch.setattr(service, "_verified_post_detail", foreign_post)
+    with pytest.raises(NeoFoxzoneError, match="不属于当前登录账号"):
+        await service.delete_qzone_msg(
+            tid="test-tid",
+            expected_author_qq=3693525299,
+            confirmation="DELETE test-tid 3693525299 3693525299",
+        )
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_nested_reply_requires_top_level_comment_relation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """楼中楼目标必须是详情中明确存在的顶层评论。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    async def no_comments(tid: str, owner_uin: int) -> dict[str, Any]:
+        return {"tid": tid, "uin": owner_uin, "commentlist": []}
+
+    monkeypatch.setattr(service, "_verified_post_detail", no_comments)
+    with pytest.raises(NeoFoxzoneError, match="不是详情中的顶层评论"):
+        await service.reply_qzone_comment(
+            tid="post-tid",
+            host_uin=20001,
+            root_comment_id="unknown-comment",
+            target_uin=20002,
+            target_name="friend",
+            content="reply",
+        )
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_adapter_provider_is_used_without_qzone_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有 OneBot Expand Service 时，使用运行时发现的 QQ Adapter。"""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    class FakeAdapter:
+        platform = "qq"
+
+        def is_connected(self) -> bool:
+            return True
+
+    monkeypatch.setattr(providers_module.service_api, "get_all_services", lambda: {})
+    monkeypatch.setattr(providers_module.service_api, "get_service", lambda _: None)
+    monkeypatch.setattr(
+        providers_module.adapter_api,
+        "get_all_adapters",
+        lambda: {"test_onebot:adapter:qq": FakeAdapter()},
+    )
+
+    async def send_adapter_command(
+        *, adapter_sign: str, command_name: str, command_data: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        calls.append((adapter_sign, command_name, command_data))
+        return {"status": "ok", "retcode": 0, "data": {"accepted": True}}
+
+    monkeypatch.setattr(
+        providers_module.adapter_api,
+        "send_adapter_command",
+        send_adapter_command,
+    )
+    snapshot = providers_module.discover_qzone_provider(refresh=True)
+    assert snapshot.source == "test_onebot:adapter:qq"
+    assert snapshot.provider is not None
+    response = await snapshot.provider.send_qzone_msg(
+        content="test",
+        images=None,
+        ugc_right=1,
+        target_uins=None,
+    )
+    assert response["status"] == "ok"
+    assert calls == [
+        (
+            "test_onebot:adapter:qq",
+            "send_qzone_msg",
+            {"content": "test", "ugc_right": 1},
+        )
     ]
-    assert manifest["dependencies"]["components"] == [
-        BACKEND_SIGNATURE,
-        ACCOUNT_SIGNATURE,
-    ]
-    assert manifest["dependencies_required"] is True
-    assert len(manifest["include"]) == 13
+
+
+def test_multiple_qq_adapters_are_not_selected_arbitrarily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """多个登录适配器同时在线时发现层不猜测读取或写入账号。"""
+    class FakeAdapter:
+        platform = "qq"
+
+        def is_connected(self) -> bool:
+            return True
+
+    monkeypatch.setattr(providers_module.service_api, "get_all_services", lambda: {})
+    monkeypatch.setattr(providers_module.service_api, "get_service", lambda _: None)
+    monkeypatch.setattr(
+        providers_module.adapter_api,
+        "get_all_adapters",
+        lambda: {
+            "snowluma:adapter:qq": FakeAdapter(),
+            "napcat:adapter:qq": FakeAdapter(),
+        },
+    )
+
+    snapshot = providers_module.discover_qzone_provider(refresh=True)
+
+    assert snapshot.provider is None
+    assert len(snapshot.adapter_signatures) == 2
+    assert "多个" in snapshot.diagnostic
 
 
 def test_repository_contains_agpl_v3_license() -> None:
@@ -690,51 +1000,17 @@ async def test_standard_image_service_uses_generic_external_contract(
 async def test_nai_artist_adapter_translates_and_normalizes_raw_base64(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """NAI 适配器应复用翻译配置，并把裸 Base64 转为 QZone 引用。"""
+    """NAI Artist 通过公开 Service 契约提供图片，FoxZone 只做格式归一化。"""
     generated: list[dict[str, Any]] = []
-    artist_config = SimpleNamespace(
-        api=SimpleNamespace(get_translate_model=lambda: "translator"),
-        character=SimpleNamespace(base_tags="1girl"),
-        wardrobe=SimpleNamespace(enabled=False, auto_daily=False),
-    )
 
     class FakeNaiService:
-        """模拟 NAI Artist 的现有非通用 Service。"""
+        """模拟 NAI Artist 的公共外部 Service 接口。"""
 
-        plugin = SimpleNamespace(config=artist_config)
-
-        async def generate_image(
-            self,
-            prompt_tags: str,
-            style_type: str,
-            config: Any,
+        async def generate_image_for_external(
+            self, *, description: str, style: str
         ) -> str:
-            generated.append(
-                {
-                    "prompt_tags": prompt_tags,
-                    "style_type": style_type,
-                    "config": config,
-                }
-            )
+            generated.append({"description": description, "style": style})
             return "a" * 64
-
-    async def translate_to_nai_tags(**kwargs: Any) -> str:
-        assert kwargs == {
-            "description": "窗边晨光",
-            "style_hint": "hint:photo",
-            "translate_model": "translator",
-            "character_profile": "1girl",
-            "mode": "photo",
-            "outfit_context": "",
-        }
-        return "best quality, window light"
-
-    def import_module(name: str) -> Any:
-        if name == "plugins.nai_artist.prompt_builder":
-            return SimpleNamespace(translate_to_nai_tags=translate_to_nai_tags)
-        if name == "plugins.nai_artist.action":
-            return SimpleNamespace(get_style_hint=lambda style: f"hint:{style}")
-        raise AssertionError(f"unexpected import: {name}")
 
     monkeypatch.setattr(
         image_provider_module.service_api,
@@ -745,8 +1021,6 @@ async def test_nai_artist_adapter_translates_and_normalizes_raw_base64(
             else None
         ),
     )
-    monkeypatch.setattr(image_provider_module.importlib, "import_module", import_module)
-
     images = await image_provider_module.generate_images(
         NeoFoxzoneConfig(),
         "窗边晨光",
@@ -754,13 +1028,7 @@ async def test_nai_artist_adapter_translates_and_normalizes_raw_base64(
     )
 
     assert images == [f"base64://{'a' * 64}"]
-    assert generated == [
-        {
-            "prompt_tags": "best quality, window light",
-            "style_type": "photo",
-            "config": artist_config,
-        }
-    ]
+    assert generated == [{"description": "窗边晨光", "style": "photo"}]
 
 
 @pytest.mark.asyncio
@@ -2024,7 +2292,7 @@ async def test_generated_publish_waits_for_provider_then_publishes_once(
     ) -> list[str]:
         events.append(f"generated:{description}:{style}")
         assert backend.calls == []
-        return ["base64://generated-image"]
+        return ["https://example.test/generated-image.png"]
 
     monkeypatch.setattr(service_module, "generate_images", generate_images)
 
@@ -2041,7 +2309,7 @@ async def test_generated_publish_waits_for_provider_then_publishes_once(
             "send_qzone_msg",
             {
                 "content": "配图说说",
-                "images": ["base64://generated-image"],
+                "images": ["base64://iVBORw0KGgo="],
                 "ugc_right": 1,
                 "target_uins": None,
             },
@@ -2772,6 +3040,73 @@ async def test_poller_skips_detail_storm_during_rate_limit_cooldown(
     assert state.rate_limit_cooldown_active() is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_detail_rate_limit_stops_queries(raises: bool) -> None:
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    calls: list[str] = []
+
+    class LimitedService:
+        async def get_qzone_msg_detail(self, tid: str, host_uin: int):
+            calls.append(tid)
+            message = "QZone 请求失败（subcode=1012）"
+            if raises:
+                raise RuntimeError(message)
+            return {"status": "failed", "retcode": -1, "msg": message}
+
+    config = NeoFoxzoneConfig()
+    config.polling.detail_request_interval_seconds = 0
+    state = state_module.PollingState()
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=config), service=LimitedService(), state=state,
+    )
+    report = poller_module.PollReport()
+    await poller._detail_candidates(
+        posts=[{"tid": "first", "comment_num": 1},
+               {"tid": "second", "comment_num": 1}],
+        source="own_post", bot_uin=99999, known_bot_comments={},
+        known_bot_comment_roots={}, report=report,
+    )
+    assert calls == ["first"]
+    assert len(report.query_errors) == 1
+    assert state.rate_limit_cooldown_active()
+
+
+@pytest.mark.asyncio
+async def test_poller_uses_direct_list_comment_tree() -> None:
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    calls: list[dict[str, Any]] = []
+
+    class DirectService:
+        async def get_qzone_user_feeds(self, **kwargs: Any):
+            calls.append(kwargs)
+            return {"status": "ok", "retcode": 0, "data": {"msglist": [{
+                "tid": "own-post", "uin": 99999, "content": "测试", "comment_num": 1,
+                "commentlist": [{"comment_id": "1", "uin": 12345,
+                                 "nickname": "访客", "content": "你好", "list_3": []}],
+            }]}}
+
+        async def get_qzone_msg_detail(self, tid: str, host_uin: int):
+            raise AssertionError("完整评论树不应重复查询详情")
+
+        async def get_qzone_feeds(self, **kwargs: Any):
+            return {"status": "ok", "retcode": 0, "data": {"feeds": []}}
+
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=NeoFoxzoneConfig()), service=DirectService(),
+        state=state_module.PollingState(),
+    )
+    report = poller_module.PollReport()
+    candidates = await poller._query_candidates(99999, report)
+    assert not report.query_errors
+    assert calls[0]["host_uin"] == 99999
+    assert len(candidates) == 1
+    assert candidates[0].detail_verified
+    assert candidates[0].root_comment_id == "1"
+
+
 def test_rate_limit_cooldown_persists_and_expires() -> None:
     """限流冷却时间戳应随状态保存并可随时间过期。"""
     state_module = importlib.import_module(f"{PACKAGE}.polling_state")
@@ -2784,3 +3119,55 @@ def test_rate_limit_cooldown_persists_and_expires() -> None:
     assert state.rate_limit_cooldown_until > time.time() + 30.0
     state.record_rate_limit_cooldown(0.0)
     assert state.rate_limit_cooldown_until > 0
+
+
+@pytest.mark.asyncio
+async def test_llm_command_does_not_publish_after_generation_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider limits must not turn a user's topic into a fake generated post."""
+    plugin, service, backend = _build_runtime(monkeypatch)
+
+    async def fail_story(self: Any, topic: str = "") -> str:
+        raise RuntimeError("429 rate limited")
+
+    monkeypatch.setattr(service_module.ContentService, "generate_story", fail_story)
+    command = NeoFoxzoneCommand(plugin, stream_id="test")
+    success, result = await command.handle_send_private("must not publish")
+
+    assert success is False
+    assert "429" in result
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reply_tool_blocks_an_unconfirmed_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The LLM entry point retains the service's thread verification gate."""
+    plugin, service, backend = _build_runtime(monkeypatch)
+    tool = tools_module.NeoFoxzoneReplyCommentTool(plugin)
+    success, result = await tool.execute(
+        tid="test-post", host_uin=3693525299, root_comment_id="unknown-root",
+        target_uin=10003, target_name="test", content="must not send",
+    )
+
+    assert success is False
+    assert "顶层" in str(result)
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_command_route_sends_its_result_back_to_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Core dispatch only executes commands; the plugin must deliver feedback."""
+    sent: list[dict[str, Any]] = []
+    plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
+    command = NeoFoxzoneCommand(plugin, stream_id="test-stream", message_id="incoming-id")
+
+    async def status() -> tuple[bool, str]:
+        return True, "test status"
+
+    async def send_text(content: str, **kwargs: Any) -> bool:
+        sent.append({"content": content, **kwargs})
+        return True
+
+    command._root.children["status"].handler = status
+    monkeypatch.setattr(commands_module.send_api, "send_text", send_text)
+    assert await command.execute("status") == (True, "test status")
+    assert sent == [{"content": "✅ test status", "stream_id": "test-stream", "reply_to": "incoming-id"}]

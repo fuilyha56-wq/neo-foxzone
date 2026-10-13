@@ -6,17 +6,18 @@ import json
 from collections.abc import Awaitable
 from typing import Literal, cast
 
-from src.app.plugin_system.api import service_api
+from src.app.plugin_system.api import send_api, service_api
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
+from src.kernel.logger import get_logger
 
 from . import (
-    ACCOUNT_SERVICE_SIGNATURE,
-    BACKEND_SERVICE_SIGNATURE,
     SERVICE_SIGNATURE,
 )
 from .config import NeoFoxzoneConfig
 from .service import NeoFoxzoneError, NeoFoxzoneService, QzoneResponse
+
+logger = get_logger("neo_foxzone.commands")
 
 
 def _parse_string_list(value: str) -> list[str] | None:
@@ -45,6 +46,32 @@ class NeoFoxzoneCommand(BaseCommand):
     permission_level = PermissionLevel.OPERATOR
     command_prefix = "/"
     dependencies = [SERVICE_SIGNATURE]
+
+    async def execute(self, message_text: str) -> tuple[bool, str]:
+        """执行路由并把结果发回触发命令的聊天。"""
+        result = await super().execute(message_text)
+        if not self.stream_id:
+            return result
+        try:
+            if self._message is not None:
+                from src.core.managers.stream_manager import get_stream_manager
+                message = self._message
+                await get_stream_manager().get_or_create_stream(
+                    stream_id=self.stream_id, platform=message.platform,
+                    chat_type=message.chat_type,
+                    user_id=message.sender_id if message.chat_type != "group" else "",
+                    group_id=str(message.extra.get("group_id") or ""),
+                    group_name=str(message.extra.get("group_name") or ""),
+                )
+            delivered = await send_api.send_text(
+                ("✅ " if result[0] else "❌ ") + result[1],
+                stream_id=self.stream_id, reply_to=self.message_id or None,
+            )
+            if not delivered:
+                logger.warning("Neo FoxZone 命令结果发送失败，操作结果仍保留。")
+        except Exception as error:
+            logger.warning(f"Neo FoxZone 命令结果发送异常: {type(error).__name__}")
+        return result
 
     def _service(self) -> NeoFoxzoneService:
         """获取 Neo FoxZone Service。"""
@@ -104,16 +131,20 @@ class NeoFoxzoneCommand(BaseCommand):
             "Neo FoxZone 命令：\n"
             "/neo-foxzone status\n"
             "/neo-foxzone posts [pos] [num]\n"
+            "/neo-foxzone user-posts <QQ号> [pos] [num]\n"
+            "/neo-foxzone detail <tid> <发布者QQ>\n"
             "/neo-foxzone feeds [page_num] [count]\n"
             "/neo-foxzone send [主题片段(最多6个)]\n"
+            "/neo-foxzone send-private \"主题\"\n"
             "/neo-foxzone publish \"正文\" [图片逗号列表] [权限] [QQ逗号列表]\n"
             "/neo-foxzone publish-ai \"正文\" \"画面描述\" [photo|drawing] [权限] [QQ逗号列表]\n"
             "/neo-foxzone poll-now\n"
             "/neo-foxzone poll-status\n"
-            "/neo-foxzone delete <tid>\n"
+            "/neo-foxzone delete <tid> <作者QQ> \"DELETE <tid> <作者QQ> <当前QQ>\"\n"
             "/neo-foxzone like <tid> [发布者QQ]\n"
             "/neo-foxzone unlike <tid> [发布者QQ]\n"
             "/neo-foxzone comment <tid> \"正文\" [发布者QQ] [图片逗号列表]\n"
+            "/neo-foxzone reply <tid> <发布者QQ> <顶层评论ID> <被回复QQ> \"昵称\" \"正文\"\n"
             "/neo-foxzone ban <QQ号> [true|false]\n"
             "/neo-foxzone visibility <tid> <权限> [QQ逗号列表]\n"
             "权限：1=所有人，4=好友，16=部分好友，64=仅自己，128=部分好友不可见。"
@@ -130,6 +161,16 @@ class NeoFoxzoneCommand(BaseCommand):
         w5: str = "",
     ) -> tuple[bool, str]:
         """以合并主题发表说说，保持原版 FoxZone 的 send 语义。"""
+        topic = " ".join(part for part in (w0, w1, w2, w3, w4, w5) if part).strip()
+        return await self._publish_topic(topic, ugc_right=1)
+
+    @cmd_route("send-private")
+    async def handle_send_private(self, topic: str = "") -> tuple[bool, str]:
+        """由 LLM 根据主题生成并发表仅自己可见的说说。"""
+        return await self._publish_topic(topic, ugc_right=64)
+
+    async def _publish_topic(self, topic: str, *, ugc_right: int) -> tuple[bool, str]:
+        """共享 LLM 生成与发布逻辑，失败时不发布主题替身。"""
         try:
             service = self._service()
         except NeoFoxzoneError as error:
@@ -139,9 +180,29 @@ class NeoFoxzoneCommand(BaseCommand):
         if not getattr(config, "plugin", None) or not config.plugin.enabled:
             return False, "FoxZone 插件当前已禁用。"
 
-        topic = " ".join(
-            part for part in (w0, w1, w2, w3, w4, w5) if part
-        ).strip()
+        if config.image.auto_decision_enabled:
+            try:
+                decision = await service.generate_topic_decision(topic=topic)
+                content = str(decision.get("content") or "").strip()
+                if not content:
+                    return False, "LLM 没有生成可发布正文。"
+                if decision.get("generate_image") is True:
+                    response = await service.send_generated_qzone_msg(
+                        content=content,
+                        image_description=str(decision.get("image_description") or ""),
+                        image_style=decision.get("image_style"),
+                        ugc_right=ugc_right,
+                    )
+                    if not service.response_succeeded(response):
+                        return False, service.response_error(response)
+                    return True, "已按 LLM 决策生成配图并发布说说。"
+                if await service.publish_feed(content, ugc_right=ugc_right):
+                    return True, f"说说已发布！内容：{content}"
+                return False, f"说说发布失败：{content}"
+            except NeoFoxzoneError as error:
+                return False, f"发布说说失败：{error}"
+            except Exception as error:
+                return False, f"发布说说失败：{error}"
 
         try:
             generated = await service.generate_topic_content(topic=topic)
@@ -154,26 +215,25 @@ class NeoFoxzoneCommand(BaseCommand):
             return False, f"发布说说失败：{generated.get('message', '未知错误')}"
 
         content = str(generated.get("message", "")).strip()
-        succeeded = await service.publish_feed(content)
+        succeeded = await service.publish_feed(content, ugc_right=ugc_right)
         if not succeeded:
             return False, f"发布说说失败：{content}"
         return True, f"说说已发布！内容：{content}"
 
     @cmd_route("status")
     async def handle_status(self) -> tuple[bool, str]:
-        """检查 Neo FoxZone 与前置 Service 是否已注册。"""
+        """检查插件、协议端自动发现和实时账号校验状态。"""
         own_service = service_api.get_service(SERVICE_SIGNATURE)
-        backend_service = service_api.get_service(BACKEND_SERVICE_SIGNATURE)
-        account_service = service_api.get_service(ACCOUNT_SERVICE_SIGNATURE)
-        ready = (
-            own_service is not None
-            and backend_service is not None
-            and account_service is not None
-        )
-        return ready, (
-            f"Neo FoxZone Service: {'已就绪' if own_service else '未注册'}\n"
-            f"OneBot Expand QZone Service: {'已就绪' if backend_service else '未注册'}\n"
-            f"OneBot Expand Account Service: {'已就绪' if account_service else '未注册'}"
+        if own_service is None:
+            return False, "Neo FoxZone Service 未注册。"
+        status = await own_service.get_capability_status()
+        return bool(status["provider_available"]), (
+            "Neo FoxZone Service: 已就绪\n"
+            f"协议端: {status['diagnostic']}\n"
+            f"当前账号: {status['account_qq']} ({status['account_status']})\n"
+            f"写操作账号: {status['expected_account_qq']}\n"
+            f"写操作预检: {'允许' if status['write_allowed'] else '阻止'}\n"
+            f"在线 QQ Adapter: {', '.join(status['adapter_signatures']) or '未发现'}"
         )
 
     @cmd_route("posts")
@@ -187,6 +247,24 @@ class NeoFoxzoneCommand(BaseCommand):
         return await self._run(
             service.get_qzone_msg_list(pos=pos, num=num),
             "说说列表获取成功。",
+        )
+
+    @cmd_route("user-posts")
+    async def handle_user_posts(
+        self, host_uin: int, pos: int = 0, num: int = 5,
+    ) -> tuple[bool, str]:
+        service = self._service()
+        return await self._run(
+            service.get_qzone_user_feeds(host_uin=host_uin, pos=pos, num=num),
+            "直连说说及评论树获取成功。",
+        )
+
+    @cmd_route("detail")
+    async def handle_detail(self, tid: str, host_uin: int) -> tuple[bool, str]:
+        service = self._service()
+        return await self._run(
+            service.get_qzone_msg_detail(tid=tid, host_uin=host_uin),
+            "说说详情及评论树获取成功。",
         )
 
     @cmd_route("feeds")
@@ -302,11 +380,20 @@ class NeoFoxzoneCommand(BaseCommand):
         return True, self._format_poll_report(report)
 
     @cmd_route("delete")
-    async def handle_delete(self, tid: str) -> tuple[bool, str]:
-        """删除指定说说。"""
+    async def handle_delete(
+        self,
+        tid: str,
+        expected_author_qq: int,
+        confirmation: str,
+    ) -> tuple[bool, str]:
+        """要求显式确认 tid、作者和当前账号后删除自己的说说。"""
         service = self._service()
         return await self._run(
-            service.delete_qzone_msg(tid=tid),
+            service.delete_qzone_msg(
+                tid=tid,
+                expected_author_qq=expected_author_qq,
+                confirmation=confirmation,
+            ),
             "说说删除成功。",
         )
 
@@ -354,6 +441,26 @@ class NeoFoxzoneCommand(BaseCommand):
                 images=_parse_string_list(images),
             ),
             "评论发送成功。",
+        )
+
+    @cmd_route("reply")
+    async def handle_reply(
+        self,
+        tid: str,
+        host_uin: int,
+        root_comment_id: str,
+        target_uin: int,
+        target_name: str,
+        content: str,
+    ) -> tuple[bool, str]:
+        """回复已确认的顶层评论线程，参数须先从详情读取。"""
+        service = self._service()
+        return await self._run(
+            service.reply_qzone_comment(
+                tid=tid, host_uin=host_uin, root_comment_id=root_comment_id,
+                target_uin=target_uin, target_name=target_name, content=content,
+            ),
+            "楼中楼回复发送成功。",
         )
 
     @cmd_route("ban")

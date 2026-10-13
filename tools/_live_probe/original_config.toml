@@ -1,0 +1,197 @@
+# 插件总开关与版本信息。
+[plugin]
+# 启用 Neo FoxZone。
+# 值类型：bool, 默认值：true
+enabled = true
+
+# 当前插件版本。
+# 值类型：str, 默认值："0.1.6"
+version = "0.1.0"
+
+# 命令和 LLM Tool 注册开关。
+[components]
+# 注册 /neo-foxzone 管理命令。
+# 值类型：bool, 默认值：true
+command_enabled = true
+
+# 注册说说列表与好友动态查询 Tool。
+# 值类型：bool, 默认值：true
+read_tools_enabled = true
+
+# 注册发布、删除、点赞、评论、黑名单和权限管理 Tool。
+# 值类型：bool, 默认值：true
+write_tools_enabled = true
+
+# 限制真实写操作必须使用明确配置的当前 Bot 账号。
+[security]
+# 真实写操作允许使用的 Bot QQ。每次发布、评论、点赞、删除、权限和黑名单操作都会通过当前登录接口确认；未知或不匹配时拒绝。
+# 值类型：str, 默认值："3693525299"
+write_account_qq = "3693525299"
+
+# 可替换的图片生成 Service 配置。
+[image]
+# 图片提供方：nai_artist 适配当前 NAI Artist；service 调用实现统一 generate_image_for_external 接口的任意 Service；disabled 禁用生图。
+# 值类型：Literal, 默认值："nai_artist"
+provider = "nai_artist"
+
+# provider=service 时的组件签名，例如 other_plugin:service:image。
+# 值类型：str, 默认值：""
+service_signature = ""
+
+# 通用图片 Service 方法名；方法接收 description 与 style 关键字参数。
+# 值类型：str, 默认值："generate_image_for_external"
+service_method = "generate_image_for_external"
+
+# 未指定时使用的默认生图风格。
+# 值类型：Literal, 默认值："drawing"
+default_style = "drawing"
+
+# 等待图片 Provider 完成生成的超时时间（秒）。
+# 值类型：float, 默认值：180.0
+timeout_seconds = 180.0
+
+# 启用主题发布时由 LLM 选择是否配图、画面描述和 photo/drawing 风格。
+# 值类型：bool, 默认值：false
+auto_decision_enabled = false
+
+# 启动检查、定时轮询和 LLM 回复边界。
+[polling]
+# 启用说说评论自动检查与回复。
+# 值类型：bool, 默认值：true
+enabled = true
+
+# 插件每次启动后立即执行一次检查。
+# 值类型：bool, 默认值：true
+startup_check = true
+
+# 启动检查后的轮询间隔（分钟）。
+# 值类型：float, 默认值：30.0
+interval_minutes = 30.0
+
+# 每轮检查自己最近说说的数量。
+# 值类型：int, 默认值：20
+own_posts_count = 20
+
+# 每轮检查好友动态的数量。
+# 值类型：int, 默认值：20
+friend_feeds_count = 20
+
+# 单轮最多成功自动回复的评论数，避免触发 QQ 空间风控。
+# 值类型：int, 默认值：5
+max_replies_per_poll = 5
+
+# 单轮最多尝试生成或发送回复的评论数。
+# 值类型：int, 默认值：10
+max_attempts_per_poll = 10
+
+# 协议明确失败后的基础重试间隔（分钟）。
+# 值类型：float, 默认值：30.0
+failure_retry_minutes = 30.0
+
+# LLM 生成失败（如网关连接错误）后的重试间隔（分钟）。生成失败与 QZone 发送失败无关，短退避即可，避免一次网关抖动让全部候选退避数小时。
+# 值类型：float, 默认值：5.0
+generation_retry_minutes = 5.0
+
+# 触发 QZone 频率限制（subcode=1012/-10049）后的退避间隔（分钟）。
+# 值类型：float, 默认值：120.0
+rate_limit_retry_minutes = 120.0
+
+# 同一轮内相邻两次回复发送之间的最小随机等待（秒），对齐原版防风控节奏。
+# 值类型：float, 默认值：15.0
+send_jitter_seconds_min = 15.0
+
+# 同一轮内相邻两次回复发送之间的最大随机等待（秒）。
+# 值类型：float, 默认值：30.0
+send_jitter_seconds_max = 30.0
+
+# 相邻两条说说详情请求之间的最小间隔（秒），避免详情风暴触发风控。
+# 值类型：float, 默认值：1.5
+detail_request_interval_seconds = 1.5
+
+# 最多保留的已处理评论和 Bot 评论 ID 数量。
+# 值类型：int, 默认值：2000
+state_max_entries = 2000
+
+# 生成自动回复所用的 model.toml 任务名称。
+# 值类型：str, 默认值："utils_small"
+model_task = "utils_small"
+
+# 自动回复正文的最大字符数。
+# 值类型：int, 默认值：180
+max_reply_chars = 180
+
+# 原版 FoxZone 自治任务总开关与运行节奏。
+[general]
+# 启用 FoxZone 自治任务。
+# 值类型：bool, 默认值：false
+enabled = false
+
+# 自治任务之间的最小检查间隔（分钟）。
+# 值类型：float, 默认值：30.0
+interval_minutes = 30.0
+
+# 插件加载后是否立即执行自治任务。
+# 值类型：bool, 默认值：false
+startup_check = false
+
+# 免打扰开始小时（0-23）。
+# 值类型：int, 默认值：0
+dnd_start = 0
+
+# 免打扰结束小时（0-23）。
+# 值类型：int, 默认值：0
+dnd_end = 0
+
+# 自治任务使用的模型和输出边界。
+[llm]
+# 自治模型任务名。
+# 值类型：str, 默认值："utils_small"
+model_task = "utils_small"
+
+# 自治回复最大字符数。
+# 值类型：int, 默认值：180
+max_reply_chars = 180
+
+# 好友动态与外部评论回查边界。
+[monitor]
+# 启用好友动态互动。
+# 值类型：bool, 默认值：true
+enabled = true
+
+# 每轮读取的好友动态数量。
+# 值类型：int, 默认值：10
+feed_count = 10
+
+# 每轮外部评论回查数量。
+# 值类型：int, 默认值：10
+followup_count = 10
+
+# 单条动态最多接力次数。
+# 值类型：int, 默认值：3
+max_external_replies = 3
+
+# 保护协议端免受明显异常输入影响。
+[limits]
+# 单次列表或动态查询允许的最大条数。
+# 值类型：int, 默认值：50
+max_query_count = 50
+
+# 单条说说或评论允许携带的最大图片数。
+# 值类型：int, 默认值：9
+max_images = 9
+
+# 单张本地或 Base64 图片的最大字节数。
+# 值类型：int, 默认值：10485760
+max_image_bytes = 10485760
+
+# 单条说说或评论正文的最大字符数。
+# 值类型：int, 默认值：2000
+max_content_chars = 2000
+
+# 相邻真实写操作的最小间隔（秒）。
+# 值类型：float, 默认值：2.0
+write_min_interval_seconds = 2.0
+
+# 管理命令输出原始 JSON 的最大字符数。
+# 值类型：int, 默认值：12000
+max_command_output_chars = 12000

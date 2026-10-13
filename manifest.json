@@ -2,25 +2,30 @@
   "name": "neo-foxzone",
   "display_name": "Neo-FoxZone",
   "version": "0.1.6",
-  "description": "基于 OneBot Expand 的 QQ 空间说说插件，支持完整管理、评论轮询自动回复、自治互动与可替换 AI 生图发布",
+  "description": "可自动发现 QQ 空间 Service 或 OneBot Adapter 的说说插件，协议端为可选能力",
   "author": "Lycoris-flower",
   "license": "AGPL-3.0",
   "dependencies": {
-    "plugins": [
-      "onebot_expand>=1.0.17"
-    ],
-    "components": [
-      "onebot_expand:service:qzone_service",
-      "onebot_expand:service:account_service"
-    ]
+    "plugins": [],
+    "components": []
   },
   "include": [
     {
+      "component_type": "tool",
+      "component_name": "neo_foxzone_read_detail",
+      "dependencies": ["neo-foxzone:service:qzone_service"],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "neo_foxzone_reply_comment",
+      "dependencies": ["neo-foxzone:service:qzone_service"],
+      "enabled": true
+    },
+    {
       "component_type": "service",
       "component_name": "qzone_service",
-      "dependencies": [
-        "onebot_expand:service:qzone_service"
-      ],
+      "dependencies": [],
       "enabled": true
     },
     {
@@ -126,7 +131,7 @@
   },
   "min_core_version": "1.0.0",
   "python_dependencies": [],
-  "dependencies_required": true,
+  "dependencies_required": false,
   "categories": [
     "tool"
   ],

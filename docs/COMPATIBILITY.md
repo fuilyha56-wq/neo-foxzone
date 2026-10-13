@@ -1,101 +1,36 @@
-# QZone Compatibility
+# 协议兼容性
 
-## Capability Boundary
+## 自动发现
 
-Neo FoxZone 完整覆盖 OneBot Expand `1.0.16` QZone Service 的 9 个公开 action，并额外
-使用两个不注册为 OneBot action 或 Tool 的内部 Service 方法：评论详情查询和楼中楼
-回复。它们专门解决 SnowLuma 公开摘要响应裁剪评论树的问题。
+Neo FoxZone 不依赖特定插件的导入路径。启动后从核心 Service Registry 查找 QZone Service，再回退到已启动的平台为 QQ 的 Adapter。通过核心 Adapter API 调用标准 OneBot action；不扫描网络、不启动本地 Web 服务，也不要求端口配置。
 
-Neo FoxZone 从不读取、持久化或记录 QQ Cookie。OneBot Expand 的内部兼容客户端会在
-单次请求中通过既有 `get_cookies(qzone.qq.com)` 使用协议端当前 QZone 会话；若 Cookie
-或 `p_skey` 不可用，方法返回失败，自动回复会跳过对应说说而不会降级为普通评论。
+SnowLuma 或 NapCat 是否可用，取决于它是否通过当前运行的 QQ Adapter 暴露相应 OneBot action。Neo FoxZone 不直接读取 SnowLuma/NapCat 的私有配置，也不会仅凭进程名或配置文件推断已登录账号。
 
-## Action Matrix
+## 能力矩阵
 
-| Action | Neo FoxZone | OneBot Expand | SnowLuma | NapCat v4.18.10+ |
-| --- | --- | --- | --- | --- |
-| `get_qzone_msg_list` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `get_qzone_feeds` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `send_qzone_msg` | 完整封装 | 已提供 | 已实现 | 已实现 |
-| `delete_qzone_msg` | 完整封装 | 已提供 | 已实现 | 已实现 |
-| `like_qzone` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `unlike_qzone` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `comment_qzone` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `set_qzone_ban` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `set_qzone_msg_right` | 完整封装 | 已提供 | 已实现 | 部分版本未实现 |
-| `get_qzone_msg_detail`（内部） | 自动回复使用 | 已提供 | 通过 Cookie 兼容层 | 未实测 |
-| `reply_qzone_comment`（内部） | 自动回复使用 | 已提供 | 通过 Cookie 兼容层 | 未实测 |
+| 能力 | OneBot Expand QZone Service | 标准 QQ Adapter 回退 | 说明 |
+| --- | --- | --- | --- |
+| 登录账号 | 可选 Account Service | `get_login_info` | 写操作逐次核验 |
+| 自己的说说 / 好友动态 | QZone Service action | `get_qzone_msg_list` / `get_qzone_feeds` | 依协议端支持情况 |
+| 发布 / 删除 / 点赞 / 评论 | QZone Service action | 对应 OneBot action | 不根据 HTTP 200 推断业务成功 |
+| 说说详情 / 评论树 | Service 或 QZone 兼容读取 | 经核验账号 Cookie 的只读 CGI | 作者和 ID 字段不明确则拒绝写操作 |
+| 楼中楼回复 | 内部 Service 或兼容路径 | 已验证顶层评论后尝试兼容回复 | 不退回普通评论 |
+| 图片发布 | QZone Service action | `send_qzone_msg` | 图片格式由协议端决定 |
+| 黑名单设置 / 权限修改 | QZone Service action | 对应 action | 仅写入能力；目标说说需确认属于本人 |
+| 资料修改 / 黑名单读取 / 权限读取 | 未确认 | 未确认 | 当前没有可依赖的公开契约 |
 
-协议实现持续演进，最终应以实际协议端版本和返回结果为准。
+## 当前环境验证记录
 
-## Known Protocol Limits
+插件代码适配的是核心注册表和 OneBot action 运行时接口。仅当对应应用进程实际运行、Adapter 已连接且实时接口返回结果时，才可把协议能力记为“已验证”。在测试报告中应分别记录 SnowLuma、NapCat 和 OneBot Expand 的发现与 action 结果；没有运行中的环境时标记“未验证”。
 
-### Automatic replies require structured comments
+OneBot Expand Service 的存在不会证明其底层 Adapter 已连接；Adapter 存在也不会证明账号已登录或具备 QZone 权限。`/neo-foxzone status` 与各 action 的实际响应是运行时判断依据。
 
-列表与动态响应仅用于发现可能有评论的说说，自动回复不会由 `comment_num` 或 HTML
-直接推断评论关系。详情响应至少需要提供：
+## 统一数据约束
 
-- 说说 ID：`tid`、`key` 等。
-- 评论 ID：明确的 `comment_id`、`commentid`；好友动态适配器还接受 `id`。
-- 评论者 QQ 与评论正文。
-- 对他人说说恢复对话时，还需要父评论 ID 或明确的被回复 QQ。
+说说详情至少需要明确返回目标 `tid` 和作者 QQ。评论必须保留评论 ID、顶层评论 ID、父评论 ID、作者 QQ 和子评论结构。只有详情中确认的顶层评论 ID可用于楼中楼回复；任何缺字段或关系冲突都会阻止回复。
 
-Neo FoxZone 会兼容 `commentlist`、`comments`、`list_3` 等明确结构，但不会从模糊
-HTML、`children` 等泛化字段或评论计数猜测作者和回复关系，也不会把说说的 `tid`、
-`key` 或 `target_uin` 当成评论关系。字段不足或关系冲突时只会得到 0 个候选。
+## 失败处理
 
-当前 SnowLuma 的公开返回映射中：
+后端返回的 `status`、`retcode`、`msg`、`wording` 和 `message` 会保留。缺少服务、未连接、未登录、action 不存在、账号不匹配和请求超时都会报告为失败或未知，不会转换为成功。
 
-- `get_qzone_msg_list` 只保留 `comment_num`，未保留 CGI 返回的评论明细。
-- `get_qzone_feeds` 主要提供预渲染 `html`，未规范化评论树。
-
-因此 Neo FoxZone 在发现候选说说后调用内部 `get_qzone_msg_detail(tid, host_uin)` 补全
-评论树。楼中楼回复只允许使用该详情返回的顶层全局评论 ID；详情、Cookie 或关系验证
-失败时安全跳过，绝不退回 `comment_qzone`。
-
-### No arbitrary-user post-list query
-
-`get_qzone_msg_list` 只有 `pos` 和 `num`，查询当前登录 QQ 的说说。它不接受
-`target_uin`，因此不能等价实现“读取任意指定 QQ 的历史说说”。
-
-### Internal detail and nested replies
-
-公开 `comment_qzone` 不接受父评论 ID 或被回复评论 ID，仍然只能发表普通评论。自动
-回复不使用它：OneBot Expand 内部的 `get_qzone_msg_detail` 以 `target_uin + tid` 读取
-完整详情，`reply_qzone_comment` 则使用详情确认的顶层评论 ID 构造 QZone 楼中楼请求。
-这两个方法要求有效 QZone Cookie，且不是可直接暴露给 LLM 的 action。
-
-### Non-empty content on SnowLuma
-
-当前 SnowLuma 的 `send_qzone_msg` 与 `comment_qzone` schema 要求 `content` 非空。
-Neo FoxZone 因此要求带图说说和带图评论也提供非空正文，不宣称支持纯图片发布。
-
-### Backend paths differ
-
-本地 `file://` 图片路径由协议端读取。Neo-MoFox 和协议端位于不同机器或容器时，
-相同路径通常不可见。跨主机部署应使用 HTTP URL 或 `base64://`。
-
-## Failure Semantics
-
-Neo FoxZone 将以下响应视为成功：
-
-- `status == "ok"`
-- 当响应没有 `status` 时，`retcode == 0`
-
-失败信息按以下顺序提取：
-
-1. `msg`
-2. `wording`
-3. `message`
-4. `retcode`
-
-Service 始终返回原始响应；Tool 和 Command 在原始响应之外增加成功状态和可读错误，
-不会丢弃协议端数据。
-
-## Verification Strategy
-
-自动测试使用严格替身验证 9 个公开 action、内部详情与楼中楼转发参数均未丢失，并覆盖
-评论结构归一化、跨重启的线程根映射、启动任务生命周期、生成后单次发布与可替换图片
-Provider。
-只读 action 可以在真实协议端直接冒烟测试；发布、删除、点赞、评论、拉黑、权限
-修改和自动回复会产生真实副作用，应在测试账号或测试说说上手动验证。
+详情和 Cookie 失败不会自动切换到不受信任的本地端口或其他账号。Cookie 只留在短期内存缓存，不写日志或磁盘。多个 Adapter 登录到不同账号时，身份结果视为有歧义；Cookie 查询必须锁定到确认的账号。

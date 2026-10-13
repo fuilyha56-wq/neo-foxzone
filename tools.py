@@ -64,6 +64,28 @@ class NeoFoxzoneListPostsTool(BaseTool):
         )
 
 
+class NeoFoxzoneDetailTool(BaseTool):
+    """读取可核实作者和顶层评论 ID 的说说详情。"""
+
+    name = "neo_foxzone_read_detail"
+    description = (
+        "读取说说详情和评论树。楼中楼回复前必须调用，核实说说作者、"
+        "顶层 comment_id 和该线程中的评论作者；不能把 tid 或子评论 ID 当顶层 ID。"
+    )
+    dependencies = [SERVICE_SIGNATURE]
+
+    async def execute(
+        self,
+        tid: Annotated[str, "说说 tid"],
+        host_uin: Annotated[int, "说说作者 QQ 号"],
+    ) -> ToolResult:
+        """读取详情。"""
+        return await _run_tool(
+            "get_qzone_msg_detail",
+            lambda service: service.get_qzone_msg_detail(tid=tid, host_uin=host_uin),
+        )
+
+
 class NeoFoxzoneListFeedsTool(BaseTool):
     """获取 QQ 空间好友动态流。"""
 
@@ -174,19 +196,28 @@ class NeoFoxzoneDeleteTool(BaseTool):
     """删除当前 QQ 发布的说说。"""
 
     tool_name = "neo_foxzone_delete"
-    tool_description = "根据 tid 删除当前 QQ 发布的说说"
+    tool_description = "确认当前账号和作者 QQ 后删除自己的测试说说"
     name = "neo_foxzone_delete"
-    description = "根据说说 ID tid 删除当前登录 QQ 发布的说说"
+    description = "删除前需要 expected_author_qq，并确认字符串 DELETE <tid> <作者QQ> <当前QQ>"
     dependencies = [SERVICE_SIGNATURE]
 
     async def execute(
         self,
         tid: Annotated[str, "说说 ID"],
+        expected_author_qq: Annotated[int, "必须等于当前登录账号的说说作者 QQ"],
+        confirmation: Annotated[
+            str,
+            "二次确认，格式为 DELETE <tid> <作者QQ> <当前QQ>",
+        ],
     ) -> ToolResult:
         """删除说说。"""
         return await _run_tool(
             "delete_qzone_msg",
-            lambda service: service.delete_qzone_msg(tid=tid),
+            lambda service: service.delete_qzone_msg(
+                tid=tid,
+                expected_author_qq=expected_author_qq,
+                confirmation=confirmation,
+            ),
         )
 
 
@@ -265,6 +296,36 @@ class NeoFoxzoneCommentTool(BaseTool):
                 content=content,
                 target_uin=target_uin or None,
                 images=images,
+            ),
+        )
+
+
+class NeoFoxzoneReplyCommentTool(BaseTool):
+    """在已核实的顶层评论下发送楼中楼回复。"""
+
+    name = "neo_foxzone_reply_comment"
+    description = (
+        "回复 QQ 空间评论线程。必须先用 neo_foxzone_read_detail 读取并确认"
+        "说说作者 host_uin、顶层 root_comment_id 和被回复者 target_uin/target_name。"
+        "回复正文由你根据评论上下文决定。关系不明时不要调用。"
+    )
+    dependencies = [SERVICE_SIGNATURE]
+
+    async def execute(
+        self,
+        tid: Annotated[str, "说说 tid"],
+        host_uin: Annotated[int, "已确认的说说作者 QQ"],
+        root_comment_id: Annotated[str, "详情返回的顶层 comment_id"],
+        target_uin: Annotated[int, "该评论线程中已确认的被回复者 QQ"],
+        target_name: Annotated[str, "被回复者昵称"],
+        content: Annotated[str, "根据评论上下文决定的回复正文"],
+    ) -> ToolResult:
+        """核验关系后发送回复。"""
+        return await _run_tool(
+            "reply_qzone_comment",
+            lambda service: service.reply_qzone_comment(
+                tid=tid, host_uin=host_uin, root_comment_id=root_comment_id,
+                target_uin=target_uin, target_name=target_name, content=content,
             ),
         )
 
@@ -512,6 +573,7 @@ class QzoneLikeFeedTool(BaseTool):
 READ_TOOLS: list[type[BaseTool]] = [
     NeoFoxzoneListPostsTool,
     NeoFoxzoneListFeedsTool,
+    NeoFoxzoneDetailTool,
     QzoneReadFeedTool,
 ]
 
@@ -523,6 +585,7 @@ WRITE_TOOLS: list[type[BaseTool]] = [
     NeoFoxzoneLikeTool,
     NeoFoxzoneUnlikeTool,
     NeoFoxzoneCommentTool,
+    NeoFoxzoneReplyCommentTool,
     NeoFoxzoneSetBlacklistTool,
     NeoFoxzoneSetVisibilityTool,
     QzonePostCommentTool,
@@ -533,6 +596,8 @@ ALL_TOOLS: list[type[BaseTool]] = [*READ_TOOLS, *WRITE_TOOLS]
 
 
 __all__ = [
+    "NeoFoxzoneDetailTool",
+    "NeoFoxzoneReplyCommentTool",
     "ALL_TOOLS",
     "NeoFoxzoneCommentTool",
     "NeoFoxzoneDeleteTool",

@@ -11,12 +11,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
-from src.app.plugin_system.api import llm_api, service_api
+from src.app.plugin_system.api import llm_api
 from src.app.plugin_system.base import BasePlugin
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 from src.kernel.logger import get_logger
 
-from . import ACCOUNT_SERVICE_SIGNATURE
 from .config import NeoFoxzoneConfig
 from .feed_parser import ReplyCandidate, ReplySource, extract_reply_candidates
 from .polling_state import PollingState
@@ -244,27 +243,20 @@ class QzoneReplyPoller:
         return NeoFoxzoneConfig()
 
     async def _load_bot_uin(self) -> int:
-        """通过 OneBot Expand Account Service 获取当前 Bot QQ。"""
-        account_service = service_api.get_service(ACCOUNT_SERVICE_SIGNATURE)
-        if account_service is None:
-            raise RuntimeError(
-                "OneBot Expand Account Service 未注册，无法识别 Bot QQ。"
-            )
-        get_login_info = getattr(account_service, "get_login_info", None)
-        if get_login_info is None or not callable(get_login_info):
-            raise RuntimeError("OneBot Expand Account Service 缺少 get_login_info。")
-        response = await get_login_info()
-        if not isinstance(response, dict):
-            raise RuntimeError("get_login_info 返回了无效响应。")
-        data = response.get("data")
-        payload = data if isinstance(data, dict) else response
-        raw_uin = payload.get("user_id") or payload.get("self_id") or payload.get("uin")
+        """通过 Neo FoxZone 实时账号校验读取当前 Bot QQ。"""
+        get_verified_account = getattr(
+            self.service,
+            "get_verified_write_account",
+            None,
+        )
+        if not callable(get_verified_account):
+            raise RuntimeError("协议端不可用或 Service 缺少实时账号校验能力。")
         try:
-            bot_uin = int(raw_uin)
+            bot_uin = int(await get_verified_account())
         except (TypeError, ValueError) as error:
-            raise RuntimeError("get_login_info 响应缺少有效 user_id。") from error
+            raise RuntimeError("实时登录接口未返回有效 Bot QQ。") from error
         if bot_uin <= 0:
-            raise RuntimeError("get_login_info 返回的 user_id 不是正整数。")
+            raise RuntimeError("实时登录接口返回的 Bot QQ 不是正整数。")
         return bot_uin
 
     async def _generate_reply(self, candidate: ReplyCandidate) -> str:
@@ -321,6 +313,17 @@ class QzoneReplyPoller:
             if value > 0:
                 return value
         return 0
+
+    def _cool_down_query(self, error: Exception | str) -> bool:
+        if not is_rate_limit_error(error):
+            return False
+        self.state.record_rate_limit_cooldown(
+            time.time() + max(
+                60.0, float(self._config().polling.rate_limit_retry_minutes) * 60.0
+            )
+        )
+        logger.warning("详情查询触发限流；停止本轮详情请求并进入冷却。")
+        return True
 
     async def _detail_candidates(
         self,
@@ -398,6 +401,8 @@ class QzoneReplyPoller:
                     f"{source_label}详情读取异常: 说说ID={post_id}, "
                     f"决策=跳过该说说，原因={error}。"
                 )
+                if self._cool_down_query(error):
+                    break
                 continue
             if not isinstance(detail_response, dict) or not NeoFoxzoneService.response_succeeded(
                 detail_response
@@ -414,6 +419,8 @@ class QzoneReplyPoller:
                     f"{source_label}详情读取失败: 说说ID={post_id}, "
                     f"决策=跳过该说说，原因={error}。"
                 )
+                if self._cool_down_query(error):
+                    break
                 continue
             detail = _response_data(detail_response)
             if not detail:
@@ -466,7 +473,7 @@ class QzoneReplyPoller:
         reply_method = getattr(self.service, "reply_qzone_comment", None)
         if reply_method is None or not callable(reply_method):
             raise RuntimeError(
-                "OneBot Expand QZone Service 缺少 reply_qzone_comment，"
+                "当前协议端或 Neo FoxZone Service 缺少安全的楼中楼回复能力，"
                 "无法安全发送楼中楼回复。"
             )
         return await reply_method(
@@ -492,10 +499,18 @@ class QzoneReplyPoller:
             for post_key, comment_roots in self.state.bot_comment_roots_by_post.items()
         }
         try:
-            own_response = await self.service.get_qzone_msg_list(
-                pos=0,
-                num=max(1, int(config.own_posts_count)),
-            )
+            get_user_feeds = getattr(self.service, "get_qzone_user_feeds", None)
+            direct_list = callable(get_user_feeds) and not self.state.rate_limit_cooldown_active()
+            if direct_list:
+                own_response = await get_user_feeds(
+                    host_uin=bot_uin, pos=0,
+                    num=max(1, int(config.own_posts_count)),
+                )
+            else:
+                own_response = await self.service.get_qzone_msg_list(
+                    pos=0,
+                    num=max(1, int(config.own_posts_count)),
+                )
             if NeoFoxzoneService.response_succeeded(own_response):
                 own_posts = _response_items(own_response, "msglist")
                 declared_comments = _declared_comment_count(own_posts)
@@ -505,16 +520,22 @@ class QzoneReplyPoller:
                 )
                 own_candidates = (
                     []
-                    if has_detail_query
+                    if has_detail_query and not direct_list
                     else extract_reply_candidates(
                         own_response,
                         bot_uin=bot_uin,
                         known_bot_comment_ids=known_bot_comments,
                         known_bot_comment_roots=known_bot_comment_roots,
+                        detail_verified=direct_list,
                     )
                 )
                 detail_candidates, detail_attempts = await self._detail_candidates(
-                    posts=own_posts,
+                    posts=[
+                        post for post in own_posts
+                        if not direct_list or _structured_comment_count([post]) < max(
+                            1, _declared_comment_count([post])
+                        )
+                    ],
                     source="own_post",
                     bot_uin=bot_uin,
                     known_bot_comments=known_bot_comments,
@@ -562,12 +583,14 @@ class QzoneReplyPoller:
             else:
                 error = NeoFoxzoneService.response_error(own_response)
                 report.query_errors.append(f"自身说说查询失败: {error}")
+                self._cool_down_query(error)
                 logger.warning(
                     f"自身说说读取失败: {error}；"
                     "决策=跳过自身说说，本轮继续读取好友动态。"
                 )
         except Exception as error:
             report.query_errors.append(f"自身说说查询异常: {error}")
+            self._cool_down_query(error)
             logger.warning(
                 f"自身说说读取异常: {error}；"
                 "决策=跳过自身说说，本轮继续读取好友动态。"
@@ -784,6 +807,9 @@ class QzoneReplyPoller:
                         "决策=不调用 LLM、不发表评论。"
                     )
             for candidate in candidates:
+                if self.state.rate_limit_cooldown_active():
+                    report.skipped_backoff += 1
+                    continue
                 label = _candidate_label(candidate)
                 logger.info(
                     f"发现自动回复候选: {label}, "

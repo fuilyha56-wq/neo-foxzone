@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from typing import Any, Literal, cast
+import binascii
+import ipaddress
+import re
+import socket
+import time
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import unquote, urlsplit
 
-from src.app.plugin_system.api import service_api
+import aiohttp
 from src.app.plugin_system.base import BaseService
+from src.kernel.logger import get_logger
 
-from . import ACCOUNT_SERVICE_SIGNATURE, BACKEND_SERVICE_SIGNATURE
 from .config import NeoFoxzoneConfig
-from .contracts import OneBotQzoneService
 from .core.llm.content_service import ContentService
-from .image_provider import ImageProviderError, generate_images
+from .image_provider import (
+    ImageProviderError,
+    generate_images,
+    normalize_image_references,
+)
+from .message_segments import UnsupportedMessageSegment, render_qzone_segments
 from .qzone_client import (
     QZoneClientError,
     QZoneDirectClient,
@@ -20,9 +33,41 @@ from .qzone_client import (
     fetch_qzone_cookie_string,
     invalidate_qzone_cookie_cache,
 )
+from .providers import discover_qzone_provider, get_current_login_info
 
 QzoneResponse = dict[str, Any]
 VALID_UGC_RIGHTS = frozenset({1, 4, 16, 64, 128})
+logger = get_logger("neo_foxzone.service")
+_WRITE_RATE_LOCK = asyncio.Lock()
+_LAST_WRITE_STARTED = 0.0
+
+
+class _PublicImageResolver(aiohttp.abc.AbstractResolver):
+    """拒绝解析到非公网地址的图片主机，防止协议端代取内网 URL。"""
+
+    def __init__(self) -> None:
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: int = socket.AF_UNSPEC,
+    ) -> list[dict[str, Any]]:
+        records = await self._resolver.resolve(host, port, family)
+        if not records:
+            raise OSError("图片主机没有公网 DNS 地址。")
+        for record in records:
+            try:
+                address = ipaddress.ip_address(record["host"])
+            except (KeyError, ValueError) as error:
+                raise OSError("图片主机 DNS 响应无法确认。") from error
+            if not address.is_global:
+                raise OSError("图片主机解析到了非公网地址。")
+        return records
+
+    async def close(self) -> None:
+        await self._resolver.close()
 
 
 class NeoFoxzoneError(RuntimeError):
@@ -30,14 +75,15 @@ class NeoFoxzoneError(RuntimeError):
 
 
 class NeoFoxzoneService(BaseService):
-    """通过 OneBot Expand 暴露全部 QQ 空间说说能力。"""
+    """经运行时发现的协议端暴露 QQ 空间说说能力。"""
 
     service_name = "qzone_service"
-    service_description = "基于 OneBot Expand 的 QQ 空间说说全功能服务"
+    service_description = "自动发现协议端的 QQ 空间说说服务"
     name = "qzone_service"
-    description = "基于 OneBot Expand 的 QQ 空间说说全功能服务"
+    description = "自动发现协议端的 QQ 空间说说服务"
     version = "0.1.6"
-    dependencies = [BACKEND_SERVICE_SIGNATURE]
+    # QZone 后端是运行时可选能力；缺失时 Service 仍注册并返回清晰诊断。
+    dependencies: list[str] = []
 
     def _config(self) -> NeoFoxzoneConfig:
         """返回当前插件配置，测试或异常装配时使用默认值。"""
@@ -54,18 +100,129 @@ class NeoFoxzoneService(BaseService):
             raise NeoFoxzoneError("FoxZone 共享运行时尚未初始化。")
         return runtime
 
-    def _backend(self) -> OneBotQzoneService:
-        """获取 OneBot Expand QQ 空间 Service。"""
+    def _backend(self) -> Any:
+        """获取当前可用的 QZone Service 或在线 QQ Adapter。"""
         if not self._config().plugin.enabled:
             raise NeoFoxzoneError("Neo FoxZone 当前已在配置中禁用。")
 
-        backend = service_api.get_service(BACKEND_SERVICE_SIGNATURE)
-        if backend is None:
+        snapshot = discover_qzone_provider()
+        if snapshot.provider is None:
             raise NeoFoxzoneError(
-                "前置服务 onebot_expand:service:qzone_service 未注册，"
-                "请确认 OneBot Expand 已安装并启用。"
+                "当前协议端不可用：" + snapshot.diagnostic
             )
-        return cast(OneBotQzoneService, backend)
+        return snapshot.provider
+
+    @staticmethod
+    def _mask_qq(qq: str | int | None) -> str:
+        """在日志中遮蔽 QQ 号。"""
+        value = str(qq or "").strip()
+        if len(value) < 7:
+            return "未知"
+        return f"{value[:4]}****{value[-4:]}"
+
+    @staticmethod
+    def _mask_identifier(value: str | int | None) -> str:
+        """遮蔽说说和评论标识。"""
+        normalized = str(value or "").strip()
+        if len(normalized) < 5:
+            return "******"
+        return f"{normalized[:2]}***{normalized[-2:]}"
+
+    def _log_write_context(
+        self,
+        operation: str,
+        current_qq: int,
+        *,
+        target_author_qq: int | None = None,
+        tid: str | None = None,
+        comment_author_qq: int | None = None,
+        root_comment_id: str | None = None,
+    ) -> None:
+        """记录脱敏后的写操作校验上下文。"""
+        logger.info(
+            "真实写操作预检通过: "
+            f"operation={operation}, current={self._mask_qq(current_qq)}, "
+            f"post_author={self._mask_qq(target_author_qq)}, "
+            f"tid={self._mask_identifier(tid)}, "
+            f"comment_author={self._mask_qq(comment_author_qq)}, "
+            f"root_comment_id={self._mask_identifier(root_comment_id)}"
+        )
+
+    async def _require_write_identity(self, operation: str) -> int:
+        """每次真实写操作都使用当前接口确认账号并比对安全配置。"""
+        expected = str(self._config().security.write_account_qq).strip()
+        login = await get_current_login_info(expected_qq=expected)
+        if login.get("status") != "confirmed":
+            reason = str(login.get("message") or "当前登录账号无法确认。")
+            logger.warning(
+                "已阻止真实写操作: "
+                f"operation={operation}, current={self._mask_qq(login.get('qq'))}, "
+                f"expected={self._mask_qq(expected)}, "
+                "reason=当前账号无法确认或与安全配置不匹配"
+            )
+            raise NeoFoxzoneError(f"已阻止真实写操作：{reason}")
+        try:
+            return int(str(login["qq"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise NeoFoxzoneError("已阻止真实写操作：当前登录 QQ 无法确认。") from error
+
+    async def _respect_write_rate_limit(self) -> None:
+        """在所有手动写操作之间施加共享的最小间隔。"""
+        global _LAST_WRITE_STARTED
+        interval = max(
+            0.0,
+            float(self._config().limits.write_min_interval_seconds),
+        )
+        if interval == 0:
+            return
+        async with _WRITE_RATE_LOCK:
+            now = time.monotonic()
+            delay = interval - (now - _LAST_WRITE_STARTED)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            _LAST_WRITE_STARTED = time.monotonic()
+
+    async def get_verified_write_account(self) -> int:
+        """供后台自动任务使用；未通过账号校验时抛出异常并跳过任务。"""
+        return await self._require_write_identity("automatic task")
+
+    @staticmethod
+    def _post_owner(detail: dict[str, Any]) -> int | None:
+        """只从说说详情中显式的作者字段读取 QQ，不使用请求目标兜底。"""
+        for key in ("uin", "owner_uin", "user_id", "owner_qq", "author_qq"):
+            value = detail.get(key)
+            try:
+                owner = int(value)
+            except (TypeError, ValueError):
+                continue
+            if owner > 0:
+                return owner
+        return None
+
+    async def _verified_post_detail(self, tid: str, owner_uin: int) -> dict[str, Any]:
+        """读取详情并确认 tid 与作者；缺字段或关系不明时拒绝写操作。"""
+        response = await self.get_qzone_msg_detail(tid=tid, host_uin=owner_uin)
+        if not self.response_succeeded(response):
+            raise NeoFoxzoneError(
+                "无法确认目标说说详情，已阻止写操作：" + self.response_error(response)
+            )
+        detail = self._response_data(response)
+        actual_tid = str(detail.get("tid") or detail.get("id") or "").strip()
+        actual_owner = self._post_owner(detail)
+        if actual_tid != tid:
+            raise NeoFoxzoneError("详情中的 tid 与目标不一致，已阻止写操作。")
+        if actual_owner is None:
+            raise NeoFoxzoneError("详情未显式返回说说作者 QQ，已阻止写操作。")
+        if actual_owner != owner_uin:
+            raise NeoFoxzoneError("详情作者与目标 QQ 不一致，已阻止写操作。")
+        return detail
+
+    async def _verify_own_post(self, tid: str, current_qq: int) -> dict[str, Any]:
+        """确认说说属于当前账号。"""
+        detail = await self._verified_post_detail(tid, current_qq)
+        if self._post_owner(detail) != current_qq:
+            raise NeoFoxzoneError("目标说说不属于当前登录账号，已阻止写操作。")
+        return detail
 
     def _validate_query(
         self,
@@ -95,14 +252,166 @@ class NeoFoxzoneService(BaseService):
             raise NeoFoxzoneError(f"{field_name} 必须是正整数 QQ 号。")
         return normalized
 
-    def _normalize_images(self, images: list[str] | None) -> list[str] | None:
+    async def _normalize_images(self, images: list[str] | None) -> list[str] | None:
         """清理图片引用并限制数量。"""
-        if images is None:
+        try:
+            normalized = normalize_image_references(images)
+        except ImageProviderError as error:
+            raise NeoFoxzoneError(str(error)) from error
+        if normalized is None:
             return None
-        normalized = [str(image).strip() for image in images if str(image).strip()]
+        normalized = [
+            await self._normalize_image_reference(image) for image in normalized
+        ]
         maximum = max(0, int(self._config().limits.max_images))
         if len(normalized) > maximum:
             raise NeoFoxzoneError(f"图片数量不能超过 {maximum} 张。")
+        return normalized
+
+    async def _normalize_image_reference(self, image: str) -> str:
+        """验证图片引用并转成限长 Base64，避免协议端代取不可信 URL。"""
+        self._validate_image_reference(image)
+        maximum_bytes = max(1, int(self._config().limits.max_image_bytes))
+        if image.startswith(("http://", "https://")):
+            return await self._download_remote_image(image, maximum_bytes)
+        if image.startswith("file://"):
+            parsed = urlsplit(image)
+            local_path = unquote(parsed.path)
+            if re.match(r"^/[A-Za-z]:/", local_path):
+                local_path = local_path[1:]
+            try:
+                path = Path(local_path).resolve(strict=True)
+                if not path.is_file():
+                    raise NeoFoxzoneError("file:// 图片必须指向本地普通文件。")
+                image_bytes = path.read_bytes()
+            except (OSError, RuntimeError, ValueError) as error:
+                raise NeoFoxzoneError("无法读取 file:// 图片文件。") from error
+            if len(image_bytes) > maximum_bytes:
+                raise NeoFoxzoneError(
+                    f"单张图片不能超过 {maximum_bytes} 字节。"
+                )
+            if not self._looks_like_image(image_bytes):
+                raise NeoFoxzoneError("本地文件内容不是支持的 PNG、JPEG、GIF、WebP 或 BMP 图片。")
+            return "base64://" + base64.b64encode(image_bytes).decode("ascii")
+
+        if image.startswith(("base64://", "data:")):
+            encoded = image.split(",", 1)[1] if image.startswith("data:") else image[9:]
+            try:
+                image_bytes = base64.b64decode("".join(encoded.split()), validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise NeoFoxzoneError("Base64 图片内容无效。") from error
+            if len(image_bytes) > maximum_bytes:
+                raise NeoFoxzoneError(f"单张图片不能超过 {maximum_bytes} 字节。")
+            if not self._looks_like_image(image_bytes):
+                raise NeoFoxzoneError("Base64 内容不是支持的 PNG、JPEG、GIF、WebP 或 BMP 图片。")
+            return "base64://" + base64.b64encode(image_bytes).decode("ascii")
+        return image
+
+    async def _download_remote_image(self, url: str, maximum_bytes: int) -> str:
+        """仅从 DNS 确认为公网的主机读取限长图片；不跟随重定向。"""
+        resolver = _PublicImageResolver()
+        connector = aiohttp.TCPConnector(resolver=resolver)
+        timeout = aiohttp.ClientTimeout(total=15.0, connect=5.0)
+        try:
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                trust_env=False,
+            ) as session:
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status != 200:
+                        raise NeoFoxzoneError(
+                            f"外部图片服务器返回 HTTP {response.status}。"
+                        )
+                    if not response.content_type.lower().startswith("image/"):
+                        raise NeoFoxzoneError("外部 URL 返回的内容不是图片。")
+                    if (
+                        response.content_length is not None
+                        and response.content_length > maximum_bytes
+                    ):
+                        raise NeoFoxzoneError(
+                            f"单张图片不能超过 {maximum_bytes} 字节。"
+                        )
+                    image_bytes = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        image_bytes.extend(chunk)
+                        if len(image_bytes) > maximum_bytes:
+                            raise NeoFoxzoneError(
+                                f"单张图片不能超过 {maximum_bytes} 字节。"
+                            )
+        except NeoFoxzoneError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as error:
+            raise NeoFoxzoneError("无法安全获取外部图片。") from error
+        if not self._looks_like_image(bytes(image_bytes)):
+            raise NeoFoxzoneError(
+                "外部 URL 返回的内容不是支持的 PNG、JPEG、GIF、WebP 或 BMP 图片。"
+            )
+        return "base64://" + base64.b64encode(image_bytes).decode("ascii")
+
+    @staticmethod
+    def _looks_like_image(image_bytes: bytes) -> bool:
+        """只接受常见栅格图片签名，拒绝伪装成图片的任意文件。"""
+        return (
+            image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            or image_bytes.startswith((b"GIF87a", b"GIF89a"))
+            or image_bytes.startswith(b"\xff\xd8\xff")
+            or (
+                len(image_bytes) >= 12
+                and image_bytes.startswith(b"RIFF")
+                and image_bytes[8:12] == b"WEBP"
+            )
+            or image_bytes.startswith(b"BM")
+        )
+
+    @staticmethod
+    def _validate_image_reference(image: str) -> None:
+        """拒绝本机/内网 HTTP 地址及非本地 file URL 主机。"""
+        if image.startswith(("base64://", "data:")):
+            return
+        try:
+            parsed = urlsplit(image)
+            port = parsed.port
+        except ValueError as error:
+            raise NeoFoxzoneError("图片 URL 格式无效。") from error
+        if parsed.scheme == "file":
+            if parsed.netloc not in {"", "localhost"}:
+                raise NeoFoxzoneError("file:// 图片只能指向本地文件，不能使用网络共享地址。")
+            return
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise NeoFoxzoneError("图片引用必须是 HTTP(S)、file:// 或 Base64 格式。")
+        expected_port = 443 if parsed.scheme == "https" else 80
+        if parsed.username or parsed.password or port not in {None, expected_port}:
+            raise NeoFoxzoneError("图片 URL 不允许账号信息或非标准 HTTP(S) 端口。")
+        hostname = parsed.hostname.rstrip(".").lower()
+        if (
+            hostname == "localhost"
+            or hostname.endswith((".localhost", ".local", ".internal"))
+            or hostname in {"metadata.google.internal", "metadata.azure.internal"}
+        ):
+            raise NeoFoxzoneError("图片 URL 不能指向本机、内网或云元数据服务。")
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            return
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise NeoFoxzoneError("图片 URL 不能指向本机、内网或保留 IP 地址。")
+
+    def _normalize_content(self, content: str, label: str) -> str:
+        """清理控制字符、HTML 标签边界和 CQ action 标记。"""
+        normalized = str(content).replace("\x00", "").strip()
+        normalized = re.sub(r"(?i)\[CQ:", "［CQ:", normalized)
+        normalized = normalized.replace("<", "&lt;").replace(">", "&gt;")
+        maximum = max(1, int(self._config().limits.max_content_chars))
+        if len(normalized) > maximum:
+            raise NeoFoxzoneError(f"{label}不能超过 {maximum} 个字符。")
         return normalized
 
     def _normalize_targets(
@@ -159,6 +468,33 @@ class NeoFoxzoneService(BaseService):
         """提取兼容 OneBot 响应中的 data 字典。"""
         data = response.get("data")
         return data if isinstance(data, dict) else {}
+
+    async def get_capability_status(self) -> dict[str, Any]:
+        """返回当前发现状态和真实登录账号校验状态，不执行写操作。"""
+        snapshot = discover_qzone_provider(refresh=True)
+        expected = str(self._config().security.write_account_qq).strip()
+        login = await get_current_login_info(expected_qq=expected)
+        return {
+            "provider_available": snapshot.provider is not None,
+            "provider": snapshot.source,
+            "diagnostic": snapshot.diagnostic,
+            "service_signatures": list(snapshot.service_signatures),
+            "adapter_signatures": list(snapshot.adapter_signatures),
+            "account_status": login.get("status", "unknown"),
+            "account_qq": self._mask_qq(login.get("qq")),
+            "expected_account_qq": self._mask_qq(expected),
+            "write_allowed": (
+                login.get("status") == "confirmed"
+                and snapshot.provider is not None
+            ),
+            "unsupported_capabilities": [
+                "资料昵称与个性签名修改：当前已检查的 QZone Service 和 action 契约未提供此接口",
+                "黑名单查询与逐条屏蔽：当前适配器契约未提供可确认接口",
+                "说说权限读取：当前适配器契约未提供可确认接口",
+                "点赞状态查询、视频/媒体归一化、转发引用字段：当前兼容层未验证",
+                "协议专属 Face ID：当前跨协议契约未验证，不会猜测映射",
+            ],
+        }
 
     @staticmethod
     def _flatten_comments(
@@ -231,25 +567,15 @@ class NeoFoxzoneService(BaseService):
 
     async def _load_self_uin(self) -> int | None:
         """从账号 Service 读取当前 Bot QQ，无法确认时返回 ``None``。"""
-        account_service = service_api.get_service(ACCOUNT_SERVICE_SIGNATURE)
-        get_login_info = getattr(account_service, "get_login_info", None)
-        if get_login_info is None or not callable(get_login_info):
+        login = await get_current_login_info()
+        if login.get("status") != "confirmed":
             return None
         try:
-            response = await get_login_info()
-        except Exception:
+            return int(str(login["qq"]))
+        except (KeyError, TypeError, ValueError):
             return None
-        if not isinstance(response, dict) or not self.response_succeeded(response):
-            return None
-        payload = self._response_data(response)
-        raw_uin = payload.get("user_id") or payload.get("self_id") or payload.get("uin")
-        try:
-            uin = int(raw_uin)
-        except (TypeError, ValueError):
-            return None
-        return uin if uin > 0 else None
 
-    async def _with_direct_client(self, operation):
+    async def _with_direct_client(self, operation, *, expected_uin: int | None = None):
         """在本地 QZone 直连客户端上执行操作，Cookie 失效时重试一次。
 
         直连客户端按原版 FoxZone 2.0.2 的浏览器级请求实现
@@ -259,7 +585,7 @@ class NeoFoxzoneService(BaseService):
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                cookie_string = await fetch_qzone_cookie_string()
+                cookie_string = await fetch_qzone_cookie_string(expected_qq=expected_uin)
             except QZoneClientError as error:
                 raise NeoFoxzoneError(str(error)) from error
             client = QZoneDirectClient.create(cookie_string)
@@ -373,8 +699,9 @@ class NeoFoxzoneService(BaseService):
         target_uins: list[int] | None = None,
     ) -> QzoneResponse:
         """发表说说，可附带图片并在发布时设置查看权限。"""
-        normalized_images = self._normalize_images(images)
-        normalized_content = str(content).strip()
+        current_qq = await self._require_write_identity("publish")
+        normalized_images = await self._normalize_images(images)
+        normalized_content = self._normalize_content(content, "说说正文")
         if not normalized_content:
             if not normalized_images:
                 raise NeoFoxzoneError("说说正文与图片不能同时为空。")
@@ -383,11 +710,37 @@ class NeoFoxzoneService(BaseService):
             ugc_right,
             target_uins,
         )
+        self._log_write_context(
+            "publish",
+            current_qq,
+            target_author_qq=current_qq,
+            tid="new",
+        )
+        await self._respect_write_rate_limit()
         return await self._backend().send_qzone_msg(
             content=normalized_content,
             images=normalized_images,
             ugc_right=normalized_right,
             target_uins=normalized_targets,
+        )
+
+    async def send_qzone_segments(
+        self,
+        segments: Iterable[Any],
+        *,
+        ugc_right: int = 1,
+        target_uins: list[int] | None = None,
+    ) -> QzoneResponse:
+        """将结构化正文/图片段转换为 QZone 正文和图片字段。"""
+        try:
+            content, images = render_qzone_segments(segments)
+        except UnsupportedMessageSegment as error:
+            raise NeoFoxzoneError(f"消息段无法安全发送：{error}") from error
+        return await self.send_qzone_msg(
+            content=content,
+            images=images or None,
+            ugc_right=ugc_right,
+            target_uins=target_uins,
         )
 
     async def send_generated_qzone_msg(
@@ -399,13 +752,20 @@ class NeoFoxzoneService(BaseService):
         target_uins: list[int] | None = None,
     ) -> QzoneResponse:
         """等待配置的图片 Service 生成完成，再把正文与图片一次性发表。"""
-        normalized_content = str(content).strip()
+        normalized_content = self._normalize_content(content, "AI 配图说说正文")
         if not normalized_content:
             raise NeoFoxzoneError("AI 配图说说正文不能为空。")
+        await self._require_write_identity("publish generated")
+        normalized_description = self._normalize_content(
+            image_description,
+            "图片描述",
+        )
+        if not normalized_description or len(normalized_description) > 400:
+            raise NeoFoxzoneError("图片描述不能为空且不能超过 400 个字符。")
         try:
             images = await generate_images(
                 self._config(),
-                image_description,
+                normalized_description,
                 image_style,
             )
         except ImageProviderError as error:
@@ -419,9 +779,41 @@ class NeoFoxzoneService(BaseService):
             target_uins=target_uins,
         )
 
-    async def delete_qzone_msg(self, tid: str) -> QzoneResponse:
-        """删除当前登录 QQ 发布的指定说说。"""
-        return await self._backend().delete_qzone_msg(self._validate_tid(tid))
+    async def delete_qzone_msg(
+        self,
+        tid: str,
+        *,
+        expected_author_qq: int,
+        confirmation: str,
+    ) -> QzoneResponse:
+        """删除当前账号自己的说说；必须显式重复确认账号和 tid。"""
+        normalized_tid = self._validate_tid(tid)
+        current_qq = await self._require_write_identity("delete")
+        normalized_author = self._validate_user_id(
+            expected_author_qq,
+            "expected_author_qq",
+        )
+        expected_confirmation = f"DELETE {normalized_tid} {normalized_author} {current_qq}"
+        if normalized_author != current_qq or str(confirmation).strip() != expected_confirmation:
+            logger.warning(
+                "已阻止真实写操作: "
+                f"operation=delete, current={self._mask_qq(current_qq)}, "
+                f"target={self._mask_qq(normalized_author)}, tid=******, "
+                "reason=confirmation mismatch"
+            )
+            raise NeoFoxzoneError(
+                "删除确认不匹配。请先读取当前账号和作者，再输入 "
+                f"{expected_confirmation!r}。"
+            )
+        await self._verify_own_post(normalized_tid, current_qq)
+        self._log_write_context(
+            "delete",
+            current_qq,
+            target_author_qq=normalized_author,
+            tid=normalized_tid,
+        )
+        await self._respect_write_rate_limit()
+        return await self._backend().delete_qzone_msg(normalized_tid)
 
     async def like_qzone(
         self,
@@ -429,13 +821,22 @@ class NeoFoxzoneService(BaseService):
         target_uin: int | None = None,
     ) -> QzoneResponse:
         """为指定说说点赞。"""
-        normalized_target = (
-            self._validate_user_id(target_uin, "target_uin")
-            if target_uin is not None
-            else None
+        current_qq = await self._require_write_identity("like")
+        normalized_tid = self._validate_tid(tid)
+        normalized_target = self._validate_user_id(
+            target_uin if target_uin is not None else current_qq,
+            "target_uin",
         )
+        await self._verified_post_detail(normalized_tid, normalized_target)
+        self._log_write_context(
+            "like",
+            current_qq,
+            target_author_qq=normalized_target,
+            tid=normalized_tid,
+        )
+        await self._respect_write_rate_limit()
         return await self._backend().like_qzone(
-            self._validate_tid(tid),
+            normalized_tid,
             normalized_target,
         )
 
@@ -445,13 +846,22 @@ class NeoFoxzoneService(BaseService):
         target_uin: int | None = None,
     ) -> QzoneResponse:
         """取消对指定说说的点赞。"""
-        normalized_target = (
-            self._validate_user_id(target_uin, "target_uin")
-            if target_uin is not None
-            else None
+        current_qq = await self._require_write_identity("unlike")
+        normalized_tid = self._validate_tid(tid)
+        normalized_target = self._validate_user_id(
+            target_uin if target_uin is not None else current_qq,
+            "target_uin",
         )
+        await self._verified_post_detail(normalized_tid, normalized_target)
+        self._log_write_context(
+            "unlike",
+            current_qq,
+            target_author_qq=normalized_target,
+            tid=normalized_tid,
+        )
+        await self._respect_write_rate_limit()
         return await self._backend().unlike_qzone(
-            self._validate_tid(tid),
+            normalized_tid,
             normalized_target,
         )
 
@@ -463,22 +873,50 @@ class NeoFoxzoneService(BaseService):
         images: list[str] | None = None,
     ) -> QzoneResponse:
         """对指定说说发表评论，可附带图片。"""
-        normalized_images = self._normalize_images(images)
-        normalized_content = str(content).strip()
+        current_qq = await self._require_write_identity("comment")
+        normalized_images = await self._normalize_images(images)
+        normalized_content = self._normalize_content(content, "评论正文")
         if not normalized_content:
             if not normalized_images:
                 raise NeoFoxzoneError("评论正文与图片不能同时为空。")
             raise NeoFoxzoneError("当前 OneBot 后端要求评论正文不能为空。")
-        normalized_target = (
-            self._validate_user_id(target_uin, "target_uin")
-            if target_uin is not None
-            else None
+        normalized_tid = self._validate_tid(tid)
+        normalized_target = self._validate_user_id(
+            target_uin if target_uin is not None else current_qq,
+            "target_uin",
         )
+        await self._verified_post_detail(normalized_tid, normalized_target)
+        self._log_write_context(
+            "comment",
+            current_qq,
+            target_author_qq=normalized_target,
+            tid=normalized_tid,
+        )
+        await self._respect_write_rate_limit()
         return await self._backend().comment_qzone(
-            tid=self._validate_tid(tid),
+            tid=normalized_tid,
             content=normalized_content,
             target_uin=normalized_target,
             images=normalized_images,
+        )
+
+    async def comment_qzone_segments(
+        self,
+        *,
+        tid: str,
+        segments: Iterable[Any],
+        target_uin: int | None = None,
+    ) -> QzoneResponse:
+        """使用文本、Unicode Emoji 和图片段发表评论。"""
+        try:
+            content, images = render_qzone_segments(segments)
+        except UnsupportedMessageSegment as error:
+            raise NeoFoxzoneError(f"评论消息段无法安全发送：{error}") from error
+        return await self.comment_qzone(
+            tid=tid,
+            content=content,
+            target_uin=target_uin,
+            images=images or None,
         )
 
     async def reply_qzone_comment(
@@ -493,7 +931,8 @@ class NeoFoxzoneService(BaseService):
         self_uin: int | None = None,
     ) -> QzoneResponse:
         """在详情确认的顶层评论下发送一条真正的楼中楼回复。"""
-        normalized_content = str(content).strip()
+        current_qq = await self._require_write_identity("reply")
+        normalized_content = self._normalize_content(content, "楼中楼回复")
         if not normalized_content:
             raise NeoFoxzoneError("楼中楼回复正文不能为空。")
         normalized_root_comment_id = str(root_comment_id).strip()
@@ -509,18 +948,65 @@ class NeoFoxzoneService(BaseService):
         )
         del normalized_self_uin  # 直连客户端从 Cookie 自身识别操作者 uin
 
+        normalized_tid = self._validate_tid(tid)
+        normalized_host = self._validate_user_id(host_uin, "host_uin")
+        normalized_target = self._validate_user_id(target_uin, "target_uin")
+        detail = await self._verified_post_detail(normalized_tid, normalized_host)
+        comments = detail.get("commentlist")
+        if not isinstance(comments, list):
+            raise NeoFoxzoneError("说说详情没有结构化顶层评论，已阻止回复。")
+        matched_root: dict[str, Any] | None = None
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            comment_id = str(comment.get("comment_id") or "").strip()
+            if comment_id == normalized_root_comment_id:
+                matched_root = comment
+                break
+        if matched_root is None:
+            raise NeoFoxzoneError("目标 ID 不是详情中的顶层评论 ID，已阻止回复。")
+        thread_authors: set[int] = set()
+
+        def collect_authors(comment: dict[str, Any]) -> None:
+            for key in ("uin", "user_id", "author_qq"):
+                try:
+                    author_qq = int(comment.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if author_qq > 0:
+                    thread_authors.add(author_qq)
+                    break
+            children = comment.get("list_3")
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        collect_authors(child)
+
+        collect_authors(matched_root)
+        if normalized_target not in thread_authors:
+            raise NeoFoxzoneError("无法在目标评论线程中确认被回复 QQ，已阻止回复。")
+        self._log_write_context(
+            "reply",
+            current_qq,
+            target_author_qq=normalized_host,
+            tid=normalized_tid,
+            comment_author_qq=normalized_target,
+            root_comment_id=normalized_root_comment_id,
+        )
+        await self._respect_write_rate_limit()
+
         async def _operation(client: QZoneDirectClient) -> dict[str, Any]:
             return await client.reply_comment(
-                host_uin=self._validate_user_id(host_uin, "host_uin"),
-                tid=self._validate_tid(tid),
+                host_uin=normalized_host,
+                tid=normalized_tid,
                 root_comment_id=normalized_root_comment_id,
-                target_uin=self._validate_user_id(target_uin, "target_uin"),
+                target_uin=normalized_target,
                 target_name=normalized_name,
                 content=normalized_content,
             )
 
         try:
-            data = await self._with_direct_client(_operation)
+            data = await self._with_direct_client(_operation, expected_uin=current_qq)
         except (NeoFoxzoneError, QZoneRateLimitError) as error:
             return self._direct_failure(error)
         except (TypeError, ValueError) as error:
@@ -531,6 +1017,8 @@ class NeoFoxzoneService(BaseService):
         self,
         content: str,
         images: list[bytes] | None = None,
+        *,
+        ugc_right: int = 1,
     ) -> bool:
         """按原版契约发布说说，并在成功后记录发布历史。"""
         image_references = (
@@ -543,6 +1031,7 @@ class NeoFoxzoneService(BaseService):
                 response = await self.send_qzone_msg(
                     content=content,
                     images=image_references,
+                    ugc_right=ugc_right,
                 )
         except (NeoFoxzoneError, ValueError, TypeError):
             return False
@@ -796,7 +1285,7 @@ class NeoFoxzoneService(BaseService):
         self,
         topic: str = "",
     ) -> dict[str, Any]:
-        """按主题生成说说正文；LLM 不可用时退回主题本身。
+        """按主题生成说说正文；LLM 失败时明确取消发布。
 
         Args:
             topic: 运营者提供的主题；为空时由 LLM 自行选择。
@@ -809,12 +1298,41 @@ class NeoFoxzoneService(BaseService):
             generated = await ContentService(self._config()).generate_story(
                 normalized_topic
             )
-        except Exception:
-            return {"success": True, "message": normalized_topic or "（无主题）"}
+        except Exception as error:
+            return {"success": False, "message": f"LLM 生成失败：{error}"}
         text = str(generated or "").strip()
         if not text:
-            return {"success": True, "message": normalized_topic or "（无主题）"}
+            return {"success": False, "message": "LLM 未返回说说正文，已取消发布。"}
         return {"success": True, "message": text}
+
+    async def generate_topic_decision(self, topic: str = "") -> dict[str, Any]:
+        """生成正文以及经 JSON 校验的可选配图决策。"""
+        normalized_topic = str(topic).strip()[:400]
+        try:
+            decision = await ContentService(self._config()).generate_story_decision(
+                normalized_topic
+            )
+        except Exception as error:
+            raise NeoFoxzoneError(f"LLM 配图决策失败，已取消发布：{error}") from error
+        content = self._normalize_content(
+            str(decision.get("content") or ""),
+            "LLM 说说正文",
+        )
+        generate_image = decision.get("generate_image") is True
+        image_description = str(decision.get("image_description") or "").strip()[:400]
+        if not content:
+            generate_image = False
+        if not image_description:
+            generate_image = False
+        image_style = decision.get("image_style")
+        if image_style not in {"photo", "drawing"}:
+            image_style = self._config().image.default_style
+        return {
+            "content": content,
+            "generate_image": generate_image,
+            "image_description": image_description if generate_image else "",
+            "image_style": image_style,
+        }
 
     async def set_qzone_ban(
         self,
@@ -822,8 +1340,18 @@ class NeoFoxzoneService(BaseService):
         enable: bool = True,
     ) -> QzoneResponse:
         """将用户加入或移出当前 QQ 空间黑名单。"""
+        current_qq = await self._require_write_identity("blacklist")
+        normalized_user_id = self._validate_user_id(user_id, "user_id")
+        if normalized_user_id == current_qq:
+            raise NeoFoxzoneError("不能将当前登录账号加入自己的空间黑名单。")
+        self._log_write_context(
+            "blacklist_add" if enable else "blacklist_remove",
+            current_qq,
+            comment_author_qq=normalized_user_id,
+        )
+        await self._respect_write_rate_limit()
         return await self._backend().set_qzone_ban(
-            user_id=self._validate_user_id(user_id, "user_id"),
+            user_id=normalized_user_id,
             enable=bool(enable),
         )
 
@@ -834,12 +1362,22 @@ class NeoFoxzoneService(BaseService):
         target_uins: list[int] | None = None,
     ) -> QzoneResponse:
         """修改已发布说说的查看权限。"""
+        current_qq = await self._require_write_identity("visibility")
+        normalized_tid = self._validate_tid(tid)
+        await self._verify_own_post(normalized_tid, current_qq)
         normalized_right, normalized_targets = self._validate_right(
             ugc_right,
             target_uins,
         )
+        self._log_write_context(
+            "visibility",
+            current_qq,
+            target_author_qq=current_qq,
+            tid=normalized_tid,
+        )
+        await self._respect_write_rate_limit()
         return await self._backend().set_qzone_msg_right(
-            tid=self._validate_tid(tid),
+            tid=normalized_tid,
             ugc_right=normalized_right,
             target_uins=normalized_targets,
         )

@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import re
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from src.app.plugin_system.api import service_api
 
 from .config import NeoFoxzoneConfig
-from .contracts import ExternalImageService
 
 ImageStyle = Literal["photo", "drawing"]
 ImageResult = str | list[str] | dict[str, Any] | None
 ImageGenerator = Callable[[str, ImageStyle], Awaitable[list[str]]]
 
 NAI_ARTIST_SERVICE_SIGNATURE = "nai_artist:service:nai_artist"
-NAI_WARDROBE_SERVICE_SIGNATURE = "nai_artist:service:wardrobe"
 _BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/\r\n]+={0,2}$")
 
 
@@ -97,8 +94,7 @@ async def _generate_with_standard_service(
         raise ImageProviderError(
             f"图片 Service {signature} 未实现方法 {method_name}(description, style)。"
         )
-    service = cast(ExternalImageService, raw_service)
-    result = await getattr(service, method_name)(
+    result = await method(
         description=description,
         style=style,
     )
@@ -112,62 +108,18 @@ async def _generate_with_nai_artist(
     description: str,
     style: ImageStyle,
 ) -> list[str]:
-    """适配 NAI Artist 的翻译、衣柜和裸 Base64 返回契约。"""
+    """通过 NAI Artist 注册的外部生图 Service 契约生成图片。"""
     raw_service = service_api.get_service(NAI_ARTIST_SERVICE_SIGNATURE)
     if raw_service is None:
         raise ImageProviderError(
             "NAI Artist Service 未注册，请安装并启用 nai_artist，或切换图片 provider。"
         )
-    artist_config = getattr(getattr(raw_service, "plugin", None), "config", None)
-    if artist_config is None:
-        raise ImageProviderError("NAI Artist Service 没有可用配置。")
-
-    outfit_context = ""
-    wardrobe_config = getattr(artist_config, "wardrobe", None)
-    if style == "photo" and bool(getattr(wardrobe_config, "enabled", False)):
-        wardrobe = service_api.get_service(NAI_WARDROBE_SERVICE_SIGNATURE)
-        if wardrobe is not None:
-            if bool(getattr(wardrobe_config, "auto_daily", False)):
-                apply_daily_rotation = getattr(wardrobe, "apply_daily_rotation", None)
-                if callable(apply_daily_rotation):
-                    apply_daily_rotation()
-            get_outfit_tags = getattr(wardrobe, "get_outfit_tags", None)
-            if callable(get_outfit_tags):
-                outfit_context = str(get_outfit_tags() or "")
-
-    prompt_builder = importlib.import_module("plugins.nai_artist.prompt_builder")
-    action_module = importlib.import_module("plugins.nai_artist.action")
-    translate = getattr(prompt_builder, "translate_to_nai_tags")
-    get_style_hint = getattr(action_module, "get_style_hint")
-    api_config = getattr(artist_config, "api", None)
-    character_config = getattr(artist_config, "character", None)
-    translate_model = ""
-    get_translate_model = getattr(api_config, "get_translate_model", None)
-    if callable(get_translate_model):
-        translate_model = str(get_translate_model() or "")
-    prompt_tags = await translate(
-        description=description,
-        style_hint=get_style_hint(style),
-        translate_model=translate_model,
-        character_profile=(
-            str(getattr(character_config, "base_tags", ""))
-            if style == "photo"
-            else ""
-        ),
-        mode=style,
-        outfit_context=outfit_context,
-    )
-    if not str(prompt_tags).strip():
-        raise ImageProviderError("NAI Artist 未能把画面描述转换为提示词。")
-
-    generate_image = getattr(raw_service, "generate_image", None)
-    if generate_image is None or not callable(generate_image):
-        raise ImageProviderError("NAI Artist Service 未实现 generate_image。")
-    result = await generate_image(
-        prompt_tags=str(prompt_tags),
-        style_type=style,
-        config=artist_config,
-    )
+    generate = getattr(raw_service, "generate_image_for_external", None)
+    if not callable(generate):
+        raise ImageProviderError(
+            "NAI Artist Service 未实现 generate_image_for_external；请更新 nai_artist。"
+        )
+    result = await generate(description=description, style=style)
     return normalize_image_result(result, assume_base64=True)
 
 
@@ -210,10 +162,24 @@ async def generate_images(
     return images
 
 
+def normalize_image_references(images: list[str] | None) -> list[str] | None:
+    """归一化手动提供的图片 URL、文件引用和 Base64 引用。"""
+    if images is None:
+        return None
+    non_empty = [str(image).strip() for image in images if str(image).strip()]
+    if not non_empty:
+        return []
+    try:
+        return normalize_image_result(non_empty)
+    except ImageProviderError:
+        raise
+
+
 __all__ = [
     "ImageProviderError",
     "ImageResult",
     "ImageStyle",
     "generate_images",
+    "normalize_image_references",
     "normalize_image_result",
 ]
