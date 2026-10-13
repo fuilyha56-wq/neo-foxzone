@@ -48,3 +48,6 @@ config/local_*.toml
 # Runtime data / media cache / logs (added by DSH 2026-08-19)
 data/
 media_cache/
+
+# Temporary local live-test probes and configuration backups
+tools/_live_probe/
