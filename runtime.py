@@ -268,10 +268,11 @@ class InteractionLog:
 class VisionCache:
     """兼容原版 ``foxzone/vision_cache`` 形状的图片描述缓存。"""
 
-    def __init__(self) -> None:
+    def __init__(self, maximum_records: int = 512) -> None:
         """创建尚未加载的视觉缓存。"""
         self._data: dict[str, str] = {}
         self._dirty = False
+        self._maximum_records = max(1, maximum_records)
 
     async def initialize(self) -> None:
         """加载可用的 URL 到描述映射。"""
@@ -293,6 +294,7 @@ class VisionCache:
 
     def get(self, url: str) -> str | None:
         """获取指定图片 URL 的缓存描述。"""
+        self._data = dict(list(self._data.items())[-self._maximum_records:])
         return self._data.get(_as_text(url))
 
     def set(self, url: str, description: str) -> None:
@@ -302,6 +304,7 @@ class VisionCache:
         if not normalized_url or not normalized_description:
             return
         self._data[normalized_url] = normalized_description
+        self._data = dict(list(self._data.items())[-self._maximum_records:])
         self._dirty = True
 
     async def save(self) -> None:
@@ -358,6 +361,10 @@ class SendHistory:
         self._dirty = True
         await self.save()
 
+    def recent(self, limit: int = 5) -> list[dict[str, str]]:
+        """返回最近成功发布的正文副本，供模型避免重复。"""
+        return [dict(item) for item in self._records[-max(1, limit):]]
+
     async def save(self) -> None:
         """在状态变更后保存发布历史。"""
         if not self._dirty:
@@ -384,6 +391,8 @@ class NeoFoxzoneRuntime:
         self.vision_cache = VisionCache()
         self.send_history = SendHistory()
         self.reply_send_lock = asyncio.Lock()
+        self.autonomous_lock = asyncio.Lock()
+        self.autonomous_reports: dict[str, dict[str, object]] = {}
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
 

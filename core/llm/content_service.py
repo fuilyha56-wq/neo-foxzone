@@ -3,47 +3,56 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from collections.abc import Iterable
 from typing import Any
 
 from src.app.plugin_system.api import llm_api
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import Image, LLMPayload, ROLE, Text
 
 from ...config import NeoFoxzoneConfig
+from .personality import build_system_prompt
 
 
 class ContentService:
     """封装 FoxZone 所有自治内容请求，保持调用方与 LLM 协议解耦。"""
 
-    def __init__(self, config: NeoFoxzoneConfig) -> None:
+    def __init__(self, config: NeoFoxzoneConfig, *, stream_id: str = "") -> None:
         """创建无状态内容服务。"""
         self.config = config
+        self.stream_id = stream_id
+        self.last_error: str | None = None
 
-    async def _request(self, system_prompt: str, user_payload: Any) -> str:
+    async def _request(self, system_prompt: str, user_payload: Any, *,
+                       model_task: str = "", images: Iterable[str] = ()) -> str:
         """发送一次非流式请求并提取文本结果。"""
-        model_set = llm_api.get_model_set_by_task(self.config.llm.model_task.strip())
+        model_set = llm_api.get_model_set_by_task(model_task.strip() or self.config.llm.model_task.strip())
         request = llm_api.create_llm_request(
             model_set=model_set,
             request_name="neo_foxzone_content",
+            **({"stream_id": self.stream_id} if self.stream_id else {}),
         )
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(build_system_prompt(
+            system_prompt, inherit_personality=self.config.llm.inherit_personality))))
         request.add_payload(
             LLMPayload(
                 ROLE.USER,
-                Text(json.dumps(user_payload, ensure_ascii=False)),
+                [Text(json.dumps(user_payload, ensure_ascii=False)),
+                 *[Image("base64|" + ref[9:]) for ref in images if ref.startswith("base64://")]],
             )
         )
-        response = await request.send(stream=False)
-        return str((await response) or "").strip()
+        async with asyncio.timeout(self.config.feedback.decision_timeout_seconds):
+            response = await request.send(stream=False)
+            return str((await response) or "").strip()
 
-    async def generate_story(self, topic: str = "") -> str:
+    async def generate_story(self, topic: str = "", recent_posts: str = "") -> str:
         """生成一条适合 QQ 空间的说说正文。"""
         prompt = (
             "请写一条自然、口语化、适合发布到 QQ 空间的中文说说。"
             "只输出正文，不要引号、标题、解释或 Markdown，长度不超过 30 字。"
         )
-        payload = {"topic": str(topic).strip() or "自由发挥", "recent_posts": ""}
-        text = await self._request(prompt, payload)
+        payload = {"topic": str(topic).strip() or "自由发挥", "recent_posts": recent_posts[:2000]}
+        text = await self._request(prompt, payload, model_task=self.config.llm.story_model_task)
         if not text:
             raise ValueError("LLM 未返回说说正文，已取消发布。")
         return text[: max(1, int(self.config.llm.max_reply_chars))].strip()
@@ -60,6 +69,7 @@ class ContentService:
         raw = await self._request(
             prompt,
             {"topic": str(topic).strip() or "自由发挥"},
+            model_task=self.config.llm.story_model_task,
         )
         try:
             parsed = json.loads(raw)
@@ -101,9 +111,9 @@ class ContentService:
             "只输出 JSON，不要解释。"
         )
         try:
-            raw = await self._request(prompt, items)
-            parsed = json.loads(raw)
-        except (Exception, json.JSONDecodeError):
+            parsed = await self._structured_decisions(prompt, items)
+        except Exception as error:
+            self.last_error = type(error).__name__
             return []
         if not isinstance(parsed, list):
             return []
@@ -139,9 +149,9 @@ class ContentService:
             "不想互动时 like=false 且 comment 为空。只输出 JSON。"
         )
         try:
-            raw = await self._request(prompt, items)
-            parsed = json.loads(raw)
-        except (Exception, json.JSONDecodeError):
+            parsed = await self._structured_decisions(prompt, items)
+        except Exception as error:
+            self.last_error = type(error).__name__
             return []
         if not isinstance(parsed, list):
             return []
@@ -164,6 +174,57 @@ class ContentService:
                 }
             )
         return results
+
+    async def _structured_decisions(self, prompt: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """每批最多九张图片；将局部模型索引映射回原候选，严格拒绝歧义。"""
+        result, offset = [], 0
+        while offset < len(items):
+            end, count = offset, 0
+            while end < len(items):
+                attached = len(items[end].get("_image_contents", []))
+                if attached > 9:
+                    raise ValueError("单个候选图片数量超过模型请求边界。")
+                if end > offset and count + attached > 9:
+                    break
+                count += attached
+                end += 1
+            payload, images = self._visual_payload(items[offset:end])
+            raw = await self._request(prompt, payload, model_task=self.config.llm.comment_model_task, images=images)
+            if raw.startswith("```json\n") and raw.endswith("\n```"):
+                raw = raw[8:-4].strip()
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise ValueError("决策必须是数组。")
+            seen = set()
+            for value in parsed:
+                index = value.get("index") if isinstance(value, dict) else None
+                if type(index) is not int or index < 0 or index >= end - offset or index in seen:
+                    raise ValueError("决策索引缺失、重复或越界。")
+                seen.add(index)
+                result.append({**value, "index": offset + index})
+            offset = end
+        return result
+
+    @staticmethod
+    def _visual_payload(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+        """图片附件不进入 JSON；按候选索引告知模型图片顺序。"""
+        payload, images = [], []
+        for index, item in enumerate(items):
+            value = dict(item)
+            attached = value.pop("_image_contents", [])
+            value["index"] = index
+            if attached:
+                value["image_attachment_range"] = [len(images), len(images) + len(attached)]
+                images.extend(attached)
+            payload.append(value)
+        return payload, images
+
+    async def generate_reply(self, context: dict[str, Any], *, model_task: str = "", maximum: int = 180) -> str:
+        """普通轮询与自治流程使用同一人格和图片输入管道。"""
+        payload, images = self._visual_payload([context])
+        text = await self._request("根据说说、评论和上下文写一句自然简短的回复。只输出正文，不要引号或解释。",
+                                   payload[0], model_task=model_task or self.config.llm.comment_model_task, images=images)
+        return text.strip().strip('"').strip()[:max(1, maximum)]
 
     async def get_recent_self_feeds_block(
         self,

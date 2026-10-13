@@ -140,6 +140,10 @@ class NeoFoxzoneCommand(BaseCommand):
             "/neo-foxzone publish-ai \"正文\" \"画面描述\" [photo|drawing] [权限] [QQ逗号列表]\n"
             "/neo-foxzone poll-now\n"
             "/neo-foxzone poll-status\n"
+            "/neo-foxzone autopilot-status\n"
+            "/neo-foxzone feedback-status\n"
+            "/neo-foxzone autopilot-now <self_comments|friend_monitor|external_followups>\n"
+            "/neo-foxzone vision \"图片引用逗号列表\"\n"
             "/neo-foxzone delete <tid> <作者QQ> \"DELETE <tid> <作者QQ> <当前QQ>\"\n"
             "/neo-foxzone like <tid> [发布者QQ]\n"
             "/neo-foxzone unlike <tid> [发布者QQ]\n"
@@ -396,6 +400,33 @@ class NeoFoxzoneCommand(BaseCommand):
             ),
             "说说删除成功。",
         )
+
+    @cmd_route("autopilot-status")
+    async def handle_autopilot_status(self) -> tuple[bool, str]:
+        return True, json.dumps(self.plugin.get_autonomous_status(), ensure_ascii=False, indent=2)
+
+    @cmd_route("autopilot-now")
+    async def handle_autopilot_now(self, flow: str = "self_comments") -> tuple[bool, str]:
+        try:
+            report = await self.plugin.run_autonomous_now(flow)
+            return not bool(report.get("failed")), json.dumps(report, ensure_ascii=False, indent=2)
+        except (RuntimeError, ValueError) as error:
+            return False, str(error)
+
+    @cmd_route("feedback-status")
+    async def handle_feedback_status(self) -> tuple[bool, str]:
+        """查询核心消息桥及待处理活动。"""
+        return True, json.dumps(self.plugin.get_feedback_status(), ensure_ascii=False, indent=2)
+
+    @cmd_route("vision")
+    async def handle_vision(self, images: str) -> tuple[bool, str]:
+        try:
+            descriptions = await self._service().describe_images(_parse_string_list(images) or [])
+            if not descriptions:
+                return False, "没有图片描述；请检查图片引用和 llm.vision_model_task。"
+            return True, "\n".join(f"图片 {i + 1}：{value}" for i, value in enumerate(descriptions.values()))
+        except Exception as error:
+            return False, f"图片理解失败：{type(error).__name__}"
 
     @cmd_route("like")
     async def handle_like(

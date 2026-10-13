@@ -17,6 +17,8 @@ from src.app.plugin_system.types import LLMPayload, ROLE, Text
 from src.kernel.logger import get_logger
 
 from .config import NeoFoxzoneConfig
+from .core.llm.content_service import ContentService
+from .core.llm.personality import build_system_prompt
 from .feed_parser import ReplyCandidate, ReplySource, extract_reply_candidates
 from .polling_state import PollingState
 from .service import NeoFoxzoneService, QzoneResponse
@@ -281,7 +283,15 @@ class QzoneReplyPoller:
             "commenter_name": candidate.commenter_name,
             "comment_content": candidate.comment_content,
         }
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SYSTEM_PROMPT)))
+        if candidate.post_images:
+            enrich = getattr(self.service, "enrich_feed_context", None)
+            if callable(enrich):
+                context = await enrich({**context, "images": list(candidate.post_images)})
+        if context.get("_image_contents"):
+            return await ContentService(self._config()).generate_reply(
+                context, model_task=config.model_task, maximum=config.max_reply_chars)
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(build_system_prompt(
+            _SYSTEM_PROMPT, inherit_personality=self._config().llm.inherit_personality))))
         request.add_payload(
             LLMPayload(
                 ROLE.USER,
@@ -755,6 +765,17 @@ class QzoneReplyPoller:
         # 触发限流后继续发送只会加重风控，终止本轮处理。
         return not rate_limited
 
+    async def collect_candidates(self, report: PollReport) -> list[ReplyCandidate]:
+        """供消息适配器复用查询与身份核验，不生成或发送回复。"""
+        try:
+            bot_uin = await self._bot_uin_loader()
+        except Exception as error:
+            report.query_errors.append(f"Bot QQ 获取失败: {type(error).__name__}")
+            return []
+        if self.state.rate_limit_cooldown_active():
+            return []
+        return self._rotate_candidates(await self._query_candidates(bot_uin, report))
+
     async def poll_once(self) -> PollReport:
         """执行一次完整检查；仅成功发布的评论会写入去重状态。"""
         async with self._poll_lock:
@@ -873,6 +894,16 @@ class QzoneReplyPoller:
                         break
                     continue
 
+                # 模型请求期间，另一条自治流程可能已经占用或处理本候选。
+                if self.state.is_processed(candidate.identity):
+                    report.skipped_processed += 1
+                    continue
+                if self.state.is_in_flight(candidate.identity):
+                    report.skipped_in_flight += 1
+                    continue
+                if self.state.rate_limit_cooldown_active():
+                    report.skipped_backoff += 1
+                    continue
                 self.state.reserve(candidate.identity)
                 try:
                     await self.state.save()

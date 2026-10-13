@@ -173,6 +173,20 @@ class NeoFoxzoneConfig(BaseConfig):
 
     polling: PollingSection = Field(default_factory=PollingSection)
 
+    @config_section("feedback", title="空间消息反馈", tag="ai")
+    class FeedbackSection(SectionBase):
+        """把轮询发现的新活动送入核心 qzone 会话。"""
+
+        enabled: bool = Field(default=True, description="新评论进入 MoFox 未读消息，由 QZone Chatter 决定回复或忽略。")
+        emit_existing_on_first_poll: bool = Field(default=False, description="首次建立基线时是否推送已有评论；默认只推送之后新增的活动。")
+        include_friend_posts: bool = Field(default=False, description="把新好友说说也作为消息，由模型决定是否评论。")
+        max_events_per_poll: int = Field(default=5, ge=1, le=20, description="每轮最多投递的新活动数量。")
+        max_pending_events: int = Field(default=200, ge=1, le=1000, description="持久待处理消息上限；满时停止接收新活动，后续轮询重试。")
+        decision_timeout_seconds: float = Field(default=90, ge=1, le=180, description="单条消息的模型决策超时。")
+        delivery_retry_seconds: float = Field(default=180, ge=30, description="核心尚未确认消费时的重新投递间隔。")
+
+    feedback: FeedbackSection = Field(default_factory=FeedbackSection)
+
     @config_section("general", title="自治总控", tag="ai")
     class GeneralSection(SectionBase):
         """原版 FoxZone 自治任务总开关与运行节奏。"""
@@ -197,6 +211,14 @@ class NeoFoxzoneConfig(BaseConfig):
 
         model_task: str = Field(default="utils_small", description="自治模型任务名。")
         max_reply_chars: int = Field(default=180, description="自治回复最大字符数。")
+        inherit_personality: bool = Field(default=True, description="生成正文、评论和轮询回复时继承核心人格。")
+        story_model_task: str = Field(default="", description="说说生成模型任务；空值沿用 model_task。")
+        comment_model_task: str = Field(default="", description="自治评论决策模型任务；空值沿用 model_task。")
+        vision_model_task: str = Field(default="vlm", description="图片理解模型任务；空值关闭图片理解。")
+        multimodal_mode: bool = Field(default=False, description="直接把已验证图片传给评论模型；开启时评论模型必须支持视觉。")
+        vision_max_images: int = Field(default=3, ge=1, le=9, description="单条动态最多理解的图片数量。")
+        vision_max_description_chars: int = Field(default=600, ge=1, le=2000, description="单张图片描述长度上限。")
+        vision_timeout_seconds: float = Field(default=60.0, ge=1, le=180, description="单张图片理解超时。")
 
     llm: LlmSection = Field(default_factory=LlmSection)
 
@@ -208,6 +230,16 @@ class NeoFoxzoneConfig(BaseConfig):
         feed_count: int = Field(default=10, description="每轮读取的好友动态数量。")
         followup_count: int = Field(default=10, description="每轮外部评论回查数量。")
         max_external_replies: int = Field(default=3, description="单条动态最多接力次数。")
+        self_comments_enabled: bool = Field(default=True, description="启用自治自身评论回复。")
+        external_followup_enabled: bool = Field(default=False, description="启用他人空间的接力回复。")
+        self_interval_minutes: float = Field(default=30.0, ge=1, description="自身评论检查间隔。")
+        friend_interval_minutes: float = Field(default=30.0, ge=1, description="好友动态主动互动间隔。")
+        external_interval_minutes: float = Field(default=60.0, ge=1, description="他人空间接力回查间隔。")
+        max_comment_age_hours: float = Field(default=72.0, ge=0, description="最大评论年龄；未知时间不猜测年龄。")
+        max_followup_age_hours: float = Field(default=168.0, ge=0, description="最长外部动态回查年龄。")
+        max_actions_per_cycle: int = Field(default=5, ge=1, le=20, description="每条自治流程每轮最多真实写入次数。")
+        max_decisions_per_cycle: int = Field(default=10, ge=1, le=50, description="每轮最多送入模型的候选数。")
+        always_like: bool = Field(default=False, description="好友动态始终点赞；关闭时由模型自主决定。")
 
     monitor: MonitorSection = Field(default_factory=MonitorSection)
 

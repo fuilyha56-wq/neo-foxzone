@@ -34,3 +34,11 @@ OneBot Expand Service 的存在不会证明其底层 Adapter 已连接；Adapter
 后端返回的 `status`、`retcode`、`msg`、`wording` 和 `message` 会保留。缺少服务、未连接、未登录、action 不存在、账号不匹配和请求超时都会报告为失败或未知，不会转换为成功。
 
 详情和 Cookie 失败不会自动切换到不受信任的本地端口或其他账号。Cookie 只留在短期内存缓存，不写日志或磁盘。多个 Adapter 登录到不同账号时，身份结果视为有歧义；Cookie 查询必须锁定到确认的账号。
+
+## 核心消息兼容与当前验证边界
+
+QZone Adapter 直接使用核心为适配器配置的进程内 CoreSink。标准信封声明 message_type=message、platform=qzone，进入核心未读和会话历史；专用 Chatter 不要求其他聊天插件存在。回复使用核心 send_api 和引用活动 ID，通过本插件 Adapter 绑定实际说说线程。
+
+SnowLuma 本轮已验证读取 31 条评论并建立基线、发布好友可见测试说说，以及真实核心接收受控说说消息重放。当前模型服务连接失败，图片描述和新消息回复完整链路尚未通过。NapCat 本轮未运行。完整记录见 FEEDBACK_TEST_2026-10-14.md。
+
+原生未读通知箱、点赞通知、已读标记接口未确认，状态明确返回 native_unread_supported=false；新增评论差分作为 MoFox 本地未读消息处理。

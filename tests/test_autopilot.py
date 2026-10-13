@@ -18,6 +18,22 @@ NeoFoxzoneConfig = config_module.NeoFoxzoneConfig
 NeoFoxzoneRuntime = runtime_module.NeoFoxzoneRuntime
 
 
+@pytest.fixture(autouse=True)
+def isolated_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit flows never read or write the running bot's persisted state."""
+    data: dict[tuple[str, str], Any] = {}
+
+    async def load(plugin_name: str, name: str, **kwargs: Any) -> Any:
+        return data.get((plugin_name, name))
+
+    async def save(plugin_name: str, name: str, value: Any, **kwargs: Any) -> None:
+        data[plugin_name, name] = value
+
+    monkeypatch.setattr(runtime_module.storage_api, "load_json", load)
+    monkeypatch.setattr(runtime_module.storage_api, "save_json", save)
+    monkeypatch.setattr(engine_module.random, "uniform", lambda *args: 0.0)
+
+
 class FakeAutonomousService:
     """In-memory FoxZone Service double for autonomous flow tests."""
 
@@ -214,3 +230,101 @@ class _FixedDateTime:
     def now(cls) -> Any:
         """Return a time inside the overnight DND interval."""
         return type("FixedNow", (), {"hour": 23})()
+
+
+@pytest.mark.asyncio
+async def test_external_followup_deduplicates_across_cycles_and_restart() -> None:
+    runtime = NeoFoxzoneRuntime()
+    await runtime.initialize()
+    service = FakeAutonomousService()
+    config = NeoFoxzoneConfig()
+    engine = AutonomousEngine(service, runtime, config, decision_generator=_decision)
+    assert await engine.run_external_followups() == 1
+    assert await engine.run_external_followups() == 0
+    service.actions.clear()
+    fresh = NeoFoxzoneRuntime()
+    await fresh.initialize()
+    assert await AutonomousEngine(service, fresh, config, decision_generator=_decision).run_external_followups() == 0
+
+
+@pytest.mark.asyncio
+async def test_reply_candidates_use_one_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = NeoFoxzoneRuntime()
+    await runtime.initialize()
+    service = FakeAutonomousService()
+    service.own_feeds[0]["comments"].append({"comment_tid": "comment-2", "qq_account": "201", "nickname": "friend2", "content": "你好"})
+    engine = AutonomousEngine(service, runtime, NeoFoxzoneConfig())
+    calls = []
+
+    async def batch(contexts):
+        calls.append(contexts)
+        return [{"index": 0, "reply": "回复一"}, {"index": 1, "reply": "回复二"}]
+
+    monkeypatch.setattr(engine._content_service, "generate_batch_replies", batch)
+    assert await engine.run_self_comments() == 2
+    assert len(calls) == 1
+    assert runtime.autonomous_reports["self_comments"]["llm_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_friend_writes_are_not_marked_read() -> None:
+    runtime = NeoFoxzoneRuntime()
+    await runtime.initialize()
+    service = FakeAutonomousService()
+
+    async def fail(*args):
+        return False
+
+    service.like = fail
+    service.comment = fail
+    engine = AutonomousEngine(service, runtime, NeoFoxzoneConfig(), decision_generator=_decision)
+    assert await engine.run_friend_monitor() == 0
+    assert not any(action[0] == "mark" and action[3] == "read" for action in service.actions)
+    assert runtime.autonomous_reports["friend_monitor"]["failed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cooldown_blocks_all_three_flows() -> None:
+    runtime = NeoFoxzoneRuntime()
+    await runtime.initialize()
+    import time
+    runtime.polling_state.record_rate_limit_cooldown(time.time() + 60)
+    service = FakeAutonomousService()
+    engine = AutonomousEngine(service, runtime, NeoFoxzoneConfig(), decision_generator=_decision)
+    assert await engine.run_self_comments() == 0
+    assert await engine.run_external_followups() == 0
+    assert await engine.run_friend_monitor() == 0
+    assert service.actions == []
+
+
+@pytest.mark.asyncio
+async def test_per_cycle_write_cap_preserves_unfinished_feed() -> None:
+    runtime = NeoFoxzoneRuntime()
+    await runtime.initialize()
+    config = NeoFoxzoneConfig()
+    config.monitor.max_actions_per_cycle = 1
+    service = FakeAutonomousService()
+    engine = AutonomousEngine(service, runtime, config, decision_generator=_decision)
+    assert await engine.run_friend_monitor() == 1
+    assert runtime.autonomous_reports["friend_monitor"]["attempted"] == 1
+    assert not any(action[0] == "mark" and action[3] == "read" for action in service.actions)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_respects_external_switch_and_dnd(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = NeoFoxzoneRuntime()
+    config = NeoFoxzoneConfig()
+    engine = AutonomousEngine(FakeAutonomousService(), runtime, config)
+    scheduler = AutonomousScheduler(engine, config)
+    calls = []
+
+    async def operation():
+        calls.append(True)
+        return 1
+
+    assert await scheduler.run_once(operation, "external_followups") == 0
+    config.monitor.external_followup_enabled = True
+    config.general.dnd_start, config.general.dnd_end = 22, 7
+    monkeypatch.setattr(engine_module, "datetime", _FixedDateTime)
+    assert await scheduler.run_once(operation, "external_followups") == 0
+    assert calls == []

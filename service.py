@@ -20,6 +20,7 @@ from src.kernel.logger import get_logger
 
 from .config import NeoFoxzoneConfig
 from .core.llm.content_service import ContentService
+from .core.llm.vision import VisionService, image_references
 from .image_provider import (
     ImageProviderError,
     generate_images,
@@ -526,6 +527,11 @@ class NeoFoxzoneService(BaseService):
                 "nickname": str(comment.get("nickname") or comment.get("name") or "").strip(),
                 "content": str(comment.get("content") or "").strip(),
             }
+            timestamp = comment.get("create_time") or comment.get("created_time") or comment.get("time")
+            if timestamp is not None:
+                normalized["created_time"] = timestamp
+            if image_references(comment):
+                normalized["images"] = image_references(comment)
             flattened.append(normalized)
             children = comment.get("list_3")
             if isinstance(children, list):
@@ -552,11 +558,7 @@ class NeoFoxzoneService(BaseService):
             "uin": str(feed.get("uin") or feed.get("target_qq") or feed.get("host_uin") or "").strip(),
             "content": str(feed.get("content") or feed.get("rt_con") or "").strip(),
             "created_time": str(feed.get("created_time") or "").strip(),
-            "images": [
-                str(image)
-                for image in feed.get("images", [])
-                if str(image).strip()
-            ],
+            "images": image_references(feed),
             "comments": normalized_comments,
             "commentlist": [
                 comment for comment in comments if isinstance(comment, dict)
@@ -1121,14 +1123,18 @@ class NeoFoxzoneService(BaseService):
                 tid=normalized_feed_id,
                 host_uin=int(normalized_host),
             )
-        except (NeoFoxzoneError, ValueError, TypeError):
+        except (NeoFoxzoneError, ValueError, TypeError) as error:
+            await self._record_background_error(error)
             return None
         if not self.response_succeeded(response):
+            await self._record_background_error(self.response_error(response))
             return None
         detail = self._response_data(response)
         if not detail:
             return None
         normalized = self._legacy_feed(detail)
+        if normalized["tid"] != normalized_feed_id or normalized["uin"] != normalized_host:
+            return None
         normalized["tid"] = normalized["tid"] or normalized_feed_id
         normalized["target_qq"] = normalized_host
         normalized["uin"] = normalized_host
@@ -1155,12 +1161,30 @@ class NeoFoxzoneService(BaseService):
         if not isinstance(raw_feeds, list):
             return []
         feeds: list[dict[str, Any]] = []
+        detail_attempts = 0
         for raw_feed in raw_feeds:
+            if self._runtime.polling_state.rate_limit_cooldown_active():
+                break
             if not isinstance(raw_feed, dict):
+                continue
+            if str(raw_feed.get("appid") or "311") != "311":
                 continue
             feed = self._legacy_feed(raw_feed)
             if not feed["tid"] or not feed["target_qq"]:
                 continue
+            # SnowLuma timeline 的 html 只是摘要，ID 与作者来自明确字段。
+            # 通过详情接口补全正文、图片和评论树，不从 HTML 猜测关系。
+            if raw_feed.get("html") and not raw_feed.get("content"):
+                if detail_attempts >= self._config().monitor.max_decisions_per_cycle:
+                    break
+                if detail_attempts:
+                    await asyncio.sleep(1.0)
+                detail_attempts += 1
+                detail = await self.get_feed_detail(feed["target_qq"], feed["tid"])
+                if detail is None:
+                    continue
+                detail["liked"] = feed["liked"]
+                feed = detail
             self._runtime.interaction_log.sync_like_state(
                 feed["target_qq"],
                 feed["tid"],
@@ -1186,8 +1210,11 @@ class NeoFoxzoneService(BaseService):
                     content=text,
                     target_uin=int(normalized_target),
                 )
-        except (NeoFoxzoneError, ValueError, TypeError):
+        except (NeoFoxzoneError, ValueError, TypeError) as error:
+            await self._record_background_error(error)
             return False
+        if not self.response_succeeded(response):
+            await self._record_background_error(self.response_error(response))
         return self.response_succeeded(response)
 
     async def like(self, target_qq: str, feed_id: str) -> bool:
@@ -1201,8 +1228,11 @@ class NeoFoxzoneService(BaseService):
                     tid=feed_id,
                     target_uin=int(normalized_target),
                 )
-        except (NeoFoxzoneError, ValueError, TypeError):
+        except (NeoFoxzoneError, ValueError, TypeError) as error:
+            await self._record_background_error(error)
             return False
+        if not self.response_succeeded(response):
+            await self._record_background_error(self.response_error(response))
         return self.response_succeeded(response)
 
     async def reply_comment(
@@ -1229,9 +1259,19 @@ class NeoFoxzoneService(BaseService):
                     target_name=target_name,
                     content=reply_text,
                 )
-        except NeoFoxzoneError:
+        except NeoFoxzoneError as error:
+            await self._record_background_error(error)
             return False
+        if not self.response_succeeded(response):
+            await self._record_background_error(self.response_error(response))
         return self.response_succeeded(response)
+
+    async def _record_background_error(self, error: Exception | str) -> None:
+        """自治封装返回布尔结果时，仍保留协议限流的共享冷却。"""
+        if re.search(r"(?:subcode|code)[=(]\s*(?:1012|-10049)\b", str(error), re.I):
+            self._runtime.polling_state.record_rate_limit_cooldown(
+                time.time() + self._config().polling.rate_limit_retry_minutes * 60)
+            await self._runtime.polling_state.save()
 
     async def has_replied_comment(self, feed_id: str, comment_tid: str) -> bool:
         """查询插件级已回复评论状态。"""
@@ -1281,6 +1321,23 @@ class NeoFoxzoneService(BaseService):
         uin = await self._load_self_uin()
         return str(uin) if uin else ""
 
+    async def describe_images(self, images: list[str]) -> dict[str, str]:
+        """理解已验证图片，失败明确传递给调用方。"""
+        return await VisionService(self._config(), self._runtime.vision_cache,
+                                   self._normalize_image_reference).describe_images(images)
+
+    async def enrich_feed_context(self, feed: dict[str, Any]) -> dict[str, Any]:
+        """在文本决策前加入图片描述，或为视觉模型准备安全附件。"""
+        context = dict(feed)
+        refs = image_references(feed)[:self._config().llm.vision_max_images]
+        context["images"] = refs
+        if refs and self._config().llm.multimodal_mode:
+            context["_image_contents"] = [await self._normalize_image_reference(ref) for ref in refs]
+        elif refs and self._config().llm.vision_model_task.strip():
+            descriptions = await self.describe_images(refs)
+            context["image_descriptions"] = list(descriptions.values())
+        return context
+
     async def generate_topic_content(
         self,
         topic: str = "",
@@ -1296,7 +1353,9 @@ class NeoFoxzoneService(BaseService):
         normalized_topic = str(topic).strip()
         try:
             generated = await ContentService(self._config()).generate_story(
-                normalized_topic
+                normalized_topic,
+                recent_posts=await ContentService(self._config()).get_recent_self_feeds_block(
+                    self._runtime.send_history.recent()),
             )
         except Exception as error:
             return {"success": False, "message": f"LLM 生成失败：{error}"}

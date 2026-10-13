@@ -120,3 +120,13 @@ Write Tools:
 `/neo-foxzone send-private "<topic>"` asks the configured LLM to write a post and publishes it with visibility `64` (only me). LLM request errors, empty content, and malformed image decisions cancel publication; they never publish the input topic as a generated result. Commands send their result back through the core message sender.
 
 All command and tool components depend only on Neo FoxZone's own Service. The provider plugin does not appear in `manifest.json` plugin or component dependencies.
+
+## QZone message feedback
+
+Components: `neo-foxzone:adapter:qzone_feedback` (platform `qzone`) and `neo-foxzone:chatter:qzone_activity` (group threads). Both depend only on this plugin service. Activity types are `comment`, `reply`, and optional new `post`. No native unread counter or mark-read action is inferred.
+
+`plugin.get_feedback_status()` returns enabled, active adapter, pending count, and the last polling report. `/neo-foxzone feedback-status` exposes the same status. Polling defaults to 30 minutes. First observation establishes a historical baseline unless `feedback.emit_existing_on_first_poll=true`. Set `feedback.include_friend_posts=true` to include new friend posts.
+
+The plugin persists `neo-foxzone/feedback_state` before delivery, acknowledges decisions separately from writes, and never automatically replays an unknown platform write. Outgoing text requires the exact incoming activity message ID as reply reference and the matching thread. The target comment is verified again against fresh detail.
+
+`describe_images(references)` uses configured vision models and validated image data; tool `neo_foxzone_describe_images` and command `vision` return successful descriptions only. Generated content inherits core personality by default. Story, comment, and vision tasks are independently configurable. Direct multimodal requests preserve index association and are split at nine images.

@@ -1,5 +1,21 @@
 # Neo FoxZone
 
+## 核心消息反馈与模型能力
+
+默认 `[feedback].enabled = true`。插件注册 `qzone_feedback` Adapter 和 `qzone_activity` Chatter，复用核心进程内 CoreSink；轮询发现的新评论、回复进入 MoFox 的未读消息和会话历史，由 LLM 决定回复正文或忽略。`/neo-foxzone feedback-status` 查看真实队列、适配器和最近投递结果；`/neo-foxzone poll-now` 立即检查。
+
+首次读取默认只建立历史基线，避免集中回复旧评论。活动保存后才投递；重启继续待处理队列；模型失败会退避；远端写入结果不明时保留占用，阻止自动重复发送。每个会话绑定作者、说说和顶层评论，发送必须引用保存的活动，并重新读取评论 ID、作者和线程关系。外部正文添加固定消息标签，避免被核心当成管理命令执行。
+
+当前 SnowLuma/OneBot 契约没有可核验的原生未读通知箱、点赞通知或已读标记接口。此处的“未读”是轮询发现的新活动进入 **MoFox 本地未读队列**，状态显示 `native_unread_supported=false`。不会声称读取了 QQ 原生未读数量，也不会清除 QQ 的未读提醒。
+
+`feedback.include_friend_posts=true` 可把新好友说说也交给核心模型决定评论或忽略；默认关闭。基础检查仍使用 `[polling]` 的间隔与查询上限，默认 30 分钟。`general.dnd_start/dnd_end` 在免打扰期间保留消息，延后模型处理。`feedback.enabled=false` 可回到原自动回复轮询和三条独立自治流程。
+
+生成说说、评论、模型回复默认继承核心人格。`llm.story_model_task`、`comment_model_task` 分别选择任务，空值沿用 `llm.model_task`；`vision_model_task` 默认 `vlm`，空值关闭视觉理解。图片先验证大小、格式和 URL，再调用视觉模型；只有成功描述会缓存，缓存有数量与每日有效期边界。`llm.multimodal_mode=true` 可直接向支持图片的评论模型传入验证后的图片，每批最多九张，附件按候选索引关联。模型没有有效输出时不发送。
+
+三条自治流程可用 `/neo-foxzone autopilot-now self_comments|friend_monitor|external_followups` 手动验证，`autopilot-status` 查看结果。`general.enabled` 控制后台自治；自身评论、外部接力和好友动态各有开关、间隔、年龄与次数上限。在反馈模式下，自身评论和接力由核心消息链处理；未开启好友说说反馈时，独立好友点赞/评论任务仍可启用。
+
+最新验证与已知运行障碍见 [消息反馈验证记录](docs/FEEDBACK_TEST_2026-10-14.md)。代码检查通过并不代表当前模型服务或所有协议端完整可用。
+
 Neo FoxZone 为 Neo-MoFox 提供 QQ 空间说说读取、发布和互动能力。OneBot Expand、OneBot Adapter、NAI Artist 都是运行时可选能力。缺少这些插件时，Neo FoxZone 仍可被发现、加载并注册 Service、命令和 Tool；相应功能会返回明确的不可用诊断。
 
 ## 协议端发现

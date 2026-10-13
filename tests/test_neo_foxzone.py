@@ -647,10 +647,13 @@ def test_plugin_registers_service_command_and_tools() -> None:
 
     assert names == [
         "qzone_service",
+        "qzone_feedback",
+        "qzone_activity",
         "neo-foxzone",
         "neo_foxzone_list_posts",
         "neo_foxzone_list_feeds",
         "neo_foxzone_read_detail",
+        "neo_foxzone_describe_images",
         "qzone_read_feed",
         "neo_foxzone_publish",
         "neo_foxzone_publish_generated",
@@ -702,7 +705,7 @@ def test_manifest_keeps_protocol_plugins_optional() -> None:
     assert manifest["dependencies"]["plugins"] == []
     assert manifest["dependencies"]["components"] == []
     assert manifest["dependencies_required"] is False
-    assert len(manifest["include"]) == 15
+    assert len(manifest["include"]) == 18
 
 
 @pytest.mark.asyncio
@@ -791,12 +794,19 @@ async def test_manual_writes_obey_minimum_interval(
     """相邻写操作会遵守可配置的最小发送间隔。"""
     _, service, _ = _build_runtime(monkeypatch)
     service._config().limits.write_min_interval_seconds = 0.02
-    await service._respect_write_rate_limit()
-    started = time.monotonic()
+    clock = [100.0]
+    delays = []
 
-    await service._respect_write_rate_limit()
+    async def sleep(delay):
+        delays.append(delay)
+        clock[0] += delay
 
-    assert time.monotonic() - started >= 0.015
+    monkeypatch.setattr(service_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(service_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(service_module, "_LAST_WRITE_STARTED", 0.0)
+    await service._respect_write_rate_limit()
+    await service._respect_write_rate_limit()
+    assert delays == [pytest.approx(0.02)]
 
 
 @pytest.mark.asyncio
@@ -2134,6 +2144,7 @@ async def test_plugin_lifecycle_runs_startup_poll_and_cancels_daemon(
 ) -> None:
     """插件加载应注册启动检查守护任务，卸载时按 task ID 取消。"""
     plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
+    plugin.config.feedback.enabled = False
     fake_service = object()
 
     class FakePoller:
@@ -3126,7 +3137,7 @@ async def test_llm_command_does_not_publish_after_generation_failure(monkeypatch
     """Provider limits must not turn a user's topic into a fake generated post."""
     plugin, service, backend = _build_runtime(monkeypatch)
 
-    async def fail_story(self: Any, topic: str = "") -> str:
+    async def fail_story(self: Any, topic: str = "", recent_posts: str = "") -> str:
         raise RuntimeError("429 rate limited")
 
     monkeypatch.setattr(service_module.ContentService, "generate_story", fail_story)
@@ -3158,6 +3169,7 @@ async def test_command_route_sends_its_result_back_to_chat(monkeypatch: pytest.M
     """Core dispatch only executes commands; the plugin must deliver feedback."""
     sent: list[dict[str, Any]] = []
     plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
+    plugin.config.feedback.enabled = False
     command = NeoFoxzoneCommand(plugin, stream_id="test-stream", message_id="incoming-id")
 
     async def status() -> tuple[bool, str]:

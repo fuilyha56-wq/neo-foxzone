@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Literal
+from .core.llm.vision import image_references
 
 ReplySource = Literal["own_post", "friend_feed"]
 
@@ -40,6 +41,7 @@ class ReplyCandidate:
     detail_verified: bool
     parent_content: str
     target_uin: int | None
+    post_images: tuple[str, ...] = ()
 
     @property
     def identity(self) -> str:
@@ -248,6 +250,7 @@ def _build_candidate(
         detail_verified=detail_verified,
         parent_content=_comment_content(parent or {}),
         target_uin=target_uin,
+        post_images=tuple(image_references(post)),
     )
 
 

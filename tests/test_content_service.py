@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any
 
 import pytest
@@ -49,8 +50,8 @@ class _FakeRequest:
 
 @pytest.mark.asyncio
 async def test_content_service_normalizes_batch_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Normalize omitted indexes and cap generated reply text."""
-    request = _FakeRequest('[{"reply": "hello"}, {"index": 4, "reply": "world"}]')
+    """Keep explicit valid indexes; no guessed association with input candidates."""
+    request = _FakeRequest('[{"index": 0, "reply": "hello"}, {"index": 1, "reply": "world"}]')
     monkeypatch.setattr(content_module.llm_api, "get_model_set_by_task", lambda name: object())
     monkeypatch.setattr(
         content_module.llm_api,
@@ -62,8 +63,36 @@ async def test_content_service_normalizes_batch_json(monkeypatch: pytest.MonkeyP
 
     result = await service.generate_batch_replies([{"content": "one"}, {"content": "two"}])
 
-    assert result == [{"index": 0, "reply": "hello"}, {"index": 4, "reply": "world"}]
+    assert result == [{"index": 0, "reply": "hello"}, {"index": 1, "reply": "world"}]
     assert len(request.payloads) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", ['[{"reply":"x"}]', '[{"index":2,"reply":"x"}]',
+                                     '[{"index":0,"reply":"x"},{"index":0,"reply":"y"}]'])
+async def test_decisions_reject_missing_out_of_range_or_duplicate_indexes(monkeypatch, response):
+    service = ContentService(NeoFoxzoneConfig())
+
+    async def request(*args, **kwargs):
+        return response
+
+    monkeypatch.setattr(service, "_request", request)
+    assert await service.generate_batch_replies([{"content": "one"}]) == []
+
+
+@pytest.mark.asyncio
+async def test_multimodal_batches_bound_images_and_remap_global_indexes(monkeypatch):
+    service = ContentService(NeoFoxzoneConfig())
+    counts = []
+
+    async def request(prompt, payload, **kwargs):
+        counts.append(len(kwargs["images"]))
+        return json.dumps([{"index": value["index"], "reply": value["content"]} for value in payload])
+
+    monkeypatch.setattr(service, "_request", request)
+    items = [{"content": str(index), "_image_contents": ["base64://AA=="] * 3} for index in range(4)]
+    assert await service.generate_batch_replies(items) == [{"index": index, "reply": str(index)} for index in range(4)]
+    assert counts == [9, 3]
 
 
 @pytest.mark.asyncio

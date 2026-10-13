@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Any, cast
 
-from src.app.plugin_system.api import service_api
+from src.app.plugin_system.api import adapter_api, service_api
 from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
@@ -20,6 +20,7 @@ from .polling_state import PollingState  # noqa: F401  兼容旧测试注入点
 from .runtime import NeoFoxzoneRuntime
 from .service import NeoFoxzoneService
 from .tools import READ_TOOLS, WRITE_TOOLS
+from .feedback import ADAPTER_SIGNATURE, ActivityBridge, ActivityStore, QzoneActivityChatter, QzoneFeedbackAdapter
 
 logger = get_logger("neo_foxzone.plugin")
 
@@ -57,6 +58,9 @@ class NeoFoxzonePlugin(BasePlugin):
         self._poll_task: asyncio.Task[Any] | None = None
         self._autonomous_task_ids: list[str] = []
         self._autonomous_tasks: list[asyncio.Task[Any]] = []
+        self._scheduler: AutonomousScheduler | None = None
+        self.feedback_store = ActivityStore(state_max_entries)
+        self._activity_bridge: ActivityBridge | None = None
 
     def _config(self) -> NeoFoxzoneConfig:
         """返回当前配置，异常装配时使用默认配置。"""
@@ -74,6 +78,8 @@ class NeoFoxzonePlugin(BasePlugin):
         if not config.plugin.enabled:
             return []
         components: list[type] = [NeoFoxzoneService]
+        if config.feedback.enabled:
+            components.extend([QzoneFeedbackAdapter, QzoneActivityChatter])
         if config.components.command_enabled:
             components.append(NeoFoxzoneCommand)
         if config.components.read_tools_enabled:
@@ -84,7 +90,7 @@ class NeoFoxzonePlugin(BasePlugin):
 
     async def _run_poll_loop(self) -> None:
         """启动即检查，并按配置间隔持续轮询。"""
-        poller = self._poller
+        poller = self._activity_bridge or self._poller
         if poller is None:
             return
         config = self._config().polling
@@ -153,6 +159,7 @@ class NeoFoxzonePlugin(BasePlugin):
                 f"plugin.enabled={config.plugin.enabled}。"
             )
             return
+        await self._stop_feedback_streams()
         try:
             await self.runtime.initialize()
         except Exception as error:
@@ -171,6 +178,11 @@ class NeoFoxzonePlugin(BasePlugin):
                 cast(NeoFoxzoneService, raw_service),
                 self.runtime.polling_state,
             )
+            if config.feedback.enabled:
+                await self.feedback_store.load()
+                self._activity_bridge = ActivityBridge(self, self._poller, raw_service)
+                if not await adapter_api.start_adapter(ADAPTER_SIGNATURE):
+                    logger.warning("空间消息适配器暂未启动；保留待处理活动，稍后重试。")
             task = get_task_manager().create_task(
                 self._run_poll_loop(),
                 name="neo_foxzone_reply_poller",
@@ -189,8 +201,7 @@ class NeoFoxzonePlugin(BasePlugin):
             )
         else:
             logger.info("Neo FoxZone 自动回复轮询已按配置禁用。")
-        if config.general.enabled:
-            scheduler = AutonomousScheduler(
+        scheduler = AutonomousScheduler(
                 AutonomousEngine(
                     cast(NeoFoxzoneService, raw_service),
                     self.runtime,
@@ -198,6 +209,8 @@ class NeoFoxzonePlugin(BasePlugin):
                 ),
                 config,
             )
+        self._scheduler = scheduler
+        if config.general.enabled:
             operations = (
                 (scheduler.engine.run_self_comments, "self_comments"),
                 (scheduler.engine.run_external_followups, "external_followups"),
@@ -205,11 +218,17 @@ class NeoFoxzonePlugin(BasePlugin):
             )
             if config.general.startup_check:
                 for operation, name in operations:
+                    if config.feedback.enabled and (name != "friend_monitor" or config.feedback.include_friend_posts):
+                        continue
                     try:
-                        await operation()
+                        await scheduler.run_once(operation, name)
                     except Exception as error:
                         logger.warning(f"FoxZone 自治启动任务 {name} 异常: {error}")
             for operation, name in operations:
+                if config.feedback.enabled and (name != "friend_monitor" or config.feedback.include_friend_posts):
+                    continue
+                if not scheduler.enabled(name):
+                    continue
                 autonomous_task = get_task_manager().create_task(
                     scheduler.run_loop(operation, name),
                     name=f"neo_foxzone_{name}",
@@ -227,6 +246,7 @@ class NeoFoxzonePlugin(BasePlugin):
 
     async def on_plugin_unloaded(self) -> None:
         """取消自动回复守护任务并清理运行时引用。"""
+        await self._stop_feedback_streams()
         for task_id in self._autonomous_task_ids:
             get_task_manager().cancel_task(task_id)
         for task in self._autonomous_tasks:
@@ -257,6 +277,11 @@ class NeoFoxzonePlugin(BasePlugin):
         self._poll_task_id = None
         self._poll_task = None
         self._poller = None
+        self._scheduler = None
+        self._activity_bridge = None
+        if self._config().feedback.enabled:
+            await adapter_api.stop_adapter(ADAPTER_SIGNATURE)
+            await self.feedback_store.save()
         try:
             await self.runtime.shutdown()
         except Exception as error:
@@ -265,17 +290,62 @@ class NeoFoxzonePlugin(BasePlugin):
                 exc_info=error,
             )
 
+    async def _stop_feedback_streams(self) -> None:
+        """热重载时停止本插件会话，避免旧 Chatter 持有旧运行时继续写入。"""
+        from src.core.managers.chatter_manager import get_chatter_manager
+        from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+        manager = get_chatter_manager()
+        for stream_id, chatter in manager.get_active_chatters().items():
+            if chatter.name == "qzone_activity" and getattr(chatter.plugin, "plugin_name", "") == self.plugin_name:
+                await get_stream_loop_manager().stop_stream_loop(stream_id)
+                manager.unregister_active_chatter(stream_id)
+
     async def poll_now(self) -> PollReport:
         """复用当前轮询器执行一次手动检查。"""
         if self._poller is None:
             raise RuntimeError("自动回复轮询器未启用或尚未初始化。")
+        if self._activity_bridge is not None:
+            return await self._activity_bridge.poll_once()
         return await self._poller.poll_once()
+
+    def get_feedback_status(self) -> dict[str, object]:
+        """返回真实消息桥的运行状态与能力边界。"""
+        return {"enabled": self._config().feedback.enabled,
+                "adapter_active": adapter_api.get_adapter(ADAPTER_SIGNATURE) is not None,
+                "native_unread_supported": False,
+                "pending_events": self.feedback_store.pending_count(),
+                "last_report": self._activity_bridge.last_report if self._activity_bridge else None}
 
     def get_poll_report(self) -> PollReport | None:
         """返回最近一次自动或手动轮询报告。"""
         if self._poller is None:
             return None
         return self._poller.last_report
+
+    async def run_autonomous_now(self, flow: str) -> dict[str, object]:
+        """运营者手动执行单条自治流程，保留独立开关和免打扰检查。"""
+        scheduler = self._scheduler
+        if scheduler is None:
+            raise RuntimeError("自治引擎尚未初始化。")
+        operations = {
+            "self_comments": scheduler.engine.run_self_comments,
+            "friend_monitor": scheduler.engine.run_friend_monitor,
+            "external_followups": scheduler.engine.run_external_followups,
+        }
+        if flow not in operations:
+            raise ValueError("flow 必须为 self_comments、friend_monitor 或 external_followups。")
+        await scheduler.run_once(operations[flow], flow)
+        return dict(self.runtime.autonomous_reports.get(flow, {}))
+
+    def get_autonomous_status(self) -> dict[str, object]:
+        """返回三条自治流程的开关、最近结果与实际后台任务数量。"""
+        config = self._config()
+        return {"background_enabled": config.general.enabled,
+                "background_tasks_running": sum(not task.done() for task in self._autonomous_tasks),
+                "cooldown_active": self.runtime.polling_state.rate_limit_cooldown_active(),
+                "flows": {name: {"enabled": self._scheduler.enabled(name) if self._scheduler else False,
+                                 "last_report": self.runtime.autonomous_reports.get(name)}
+                          for name in ("self_comments", "friend_monitor", "external_followups")}}
 
 
 __all__ = ["NeoFoxzonePlugin"]

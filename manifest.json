@@ -10,6 +10,14 @@
     "components": []
   },
   "include": [
+    {"component_type": "adapter", "component_name": "qzone_feedback", "dependencies": ["neo-foxzone:service:qzone_service"], "enabled": true},
+    {"component_type": "chatter", "component_name": "qzone_activity", "dependencies": ["neo-foxzone:service:qzone_service"], "enabled": true},
+    {
+      "component_type": "tool",
+      "component_name": "neo_foxzone_describe_images",
+      "dependencies": ["neo-foxzone:service:qzone_service"],
+      "enabled": true
+    },
     {
       "component_type": "tool",
       "component_name": "neo_foxzone_read_detail",
@@ -125,6 +133,7 @@
   ],
   "entry_point": "plugin.py",
   "api_version": {
+    "config_api": "1.0.0",
     "llm_api": "1.0.0",
     "service_api": "1.0.0",
     "storage_api": "1.0.0"
