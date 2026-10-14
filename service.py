@@ -82,7 +82,7 @@ class NeoFoxzoneService(BaseService):
     service_description = "自动发现协议端的 QQ 空间说说服务"
     name = "qzone_service"
     description = "自动发现协议端的 QQ 空间说说服务"
-    version = "0.1.6"
+    version = "0.1.7"
     # QZone 后端是运行时可选能力；缺失时 Service 仍注册并返回清晰诊断。
     dependencies: list[str] = []
 

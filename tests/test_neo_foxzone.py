@@ -671,9 +671,9 @@ def test_plugin_registers_service_command_and_tools() -> None:
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.6"
+    assert plugin.plugin_version == "0.1.7"
     assert plugin.dependencies == []
-    assert plugin.config.plugin.version == "0.1.6"
+    assert plugin.config.plugin.version == "0.1.7"
 
 
 def test_plugin_revalidates_cached_config_after_module_reload() -> None:
@@ -692,7 +692,7 @@ def test_plugin_revalidates_cached_config_after_module_reload() -> None:
     assert plugin.config.security.write_account_qq == "10003"
     assert plugin.config.polling.enabled is False
     assert plugin.get_components() == []
-    assert NeoFoxzoneService.version == "0.1.6"
+    assert NeoFoxzoneService.version == "0.1.7"
 
 
 def test_manifest_keeps_protocol_plugins_optional() -> None:
@@ -701,7 +701,7 @@ def test_manifest_keeps_protocol_plugins_optional() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.6"
+    assert manifest["version"] == "0.1.7"
     assert manifest["dependencies"]["plugins"] == []
     assert manifest["dependencies"]["components"] == []
     assert manifest["dependencies_required"] is False

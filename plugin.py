@@ -38,7 +38,7 @@ class NeoFoxzonePlugin(BasePlugin):
 
     plugin_name = "neo-foxzone"
     plugin_description = "自动发现兼容 QZone Service 或 OneBot Adapter 的 QQ 空间插件"
-    plugin_version = "0.1.6"
+    plugin_version = "0.1.7"
     configs = [NeoFoxzoneConfig]
     # 协议端在运行时发现，缺少 OneBot Expand 不阻止插件注册。
     dependencies: list[str] = []
