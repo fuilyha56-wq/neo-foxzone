@@ -42,7 +42,8 @@ OneBot Expand、SnowLuma、NapCat 和图片生成插件不是安装时的强制�
 
 ```toml
 [security]
-write_account_qq = "3693525299"
+# 可留空并自动读取唯一在线账号；填写后会额外限制为该 QQ
+write_account_qq = ""
 
 [polling]
 enabled = true
@@ -64,7 +65,9 @@ vision_model_task = "vlm"
 multimodal_mode = false
 ```
 
-`write_account_qq` 是真实写操作的账号保护值。每次发布、评论、回复、点赞、删除、黑名单或可见范围修改前，插件都会核对当前登录账号；未知、不一致或多个 Adapter 报告不一致时会拒绝写入。运行在其他 QQ 账号上时，应先修改该值。
+`write_account_qq` 是可选的账号限制。留空时，插件会从框架账号 Service 或唯一已连接的 QQ Adapter 读取当前 Bot QQ；每次发布、评论、回复、点赞、删除、黑名单或可见范围修改前，仍会核验实时登录身份。检测不到账号、多个 Adapter 报告不同账号，或与填写的限制值不符时，插件会拒绝执行。
+
+从旧版本升级且此项保留了旧默认账号、但与当前登录 QQ 不同的用户，可以清空此项以启用自动识别。
 
 `polling.model_task` 选择自动回复模型任务；评论活动进入核心消息链后，由 MoFox 的 Chatter 和 LLM 决定是否回复。核心任务使用 `[llm].model_task`。`vision_model_task` 控制图片理解；设为空值会关闭视觉理解。直接向支持图片的模型发送图片需启用 `multimodal_mode`。
 

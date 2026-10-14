@@ -222,6 +222,7 @@ def _build_runtime(
 ) -> tuple[Any, Any, FakeQzoneBackend]:
     """创建插件、Service 和可解析两个签名的替身运行时。"""
     config = NeoFoxzoneConfig()
+    config.security.write_account_qq = "3693525299"
     config.limits.write_min_interval_seconds = 0
     plugin = NeoFoxzonePlugin(config=config)
     service = NeoFoxzoneService(plugin)
@@ -726,6 +727,28 @@ async def test_write_is_blocked_when_login_account_is_unknown(
 
 
 @pytest.mark.asyncio
+async def test_write_account_is_discovered_when_optional_restriction_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """留空账号限制时从实时登录接口读取当前 Bot QQ。"""
+    _, service, backend = _build_runtime(monkeypatch)
+    service._config().security.write_account_qq = ""
+    observed_expected: list[str | None] = []
+
+    async def current_login(*, expected_qq: str | None = None) -> dict[str, Any]:
+        observed_expected.append(expected_qq)
+        return {"status": "confirmed", "qq": "8123456789"}
+
+    monkeypatch.setattr(service_module, "get_current_login_info", current_login)
+
+    response = await service.send_qzone_msg(content="自动读取账号")
+
+    assert response["status"] == "ok"
+    assert observed_expected == [None]
+    assert backend.calls[0][1]["content"] == "自动读取账号"
+
+
+@pytest.mark.asyncio
 async def test_background_account_check_does_not_log_as_a_blocked_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -756,6 +779,24 @@ async def test_background_account_check_does_not_log_as_a_blocked_write(
 
 
 @pytest.mark.asyncio
+async def test_background_account_uses_live_qq_without_user_specific_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认配置不固定任何 QQ，后台账号来自当前实时登录接口。"""
+    config = NeoFoxzoneConfig()
+    assert config.security.write_account_qq == ""
+    service = NeoFoxzoneService(NeoFoxzonePlugin(config=config))
+
+    async def current_login(*, expected_qq: str | None = None) -> dict[str, Any]:
+        assert expected_qq is None
+        return {"status": "confirmed", "qq": "8123456789"}
+
+    monkeypatch.setattr(service_module, "get_current_login_info", current_login)
+
+    assert await service.get_verified_write_account() == 8123456789
+
+
+@pytest.mark.asyncio
 async def test_unknown_account_diagnostic_points_to_unconnected_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -771,6 +812,43 @@ async def test_unknown_account_diagnostic_points_to_unconnected_adapter(
     assert result["status"] == "unknown"
     assert "未发现已连接的 QQ Adapter" in result["message"]
     assert "OneBot Adapter 已启用" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_current_qq_is_read_from_unique_connected_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有账号限制时从唯一在线 QQ Adapter 的登录接口读取 QQ。"""
+    class FakeAdapter:
+        platform = "qq"
+
+        def is_connected(self) -> bool:
+            return True
+
+    monkeypatch.setattr(providers_module.service_api, "get_service", lambda _: None)
+    monkeypatch.setattr(providers_module.adapter_api, "get_all_adapters", lambda: {
+        "onebot_adapter:adapter:onebot_adapter": FakeAdapter()
+    })
+
+    async def send_adapter_command(
+        *, adapter_sign: str, command_name: str,
+        command_data: dict[str, Any], timeout: float,
+    ) -> dict[str, Any]:
+        assert adapter_sign == "onebot_adapter:adapter:onebot_adapter"
+        assert command_name == "get_login_info"
+        assert command_data == {}
+        return {"status": "ok", "data": {"user_id": "8123456789"}}
+
+    monkeypatch.setattr(
+        providers_module.adapter_api,
+        "send_adapter_command",
+        send_adapter_command,
+    )
+
+    result = await providers_module.get_current_login_info()
+
+    assert result["status"] == "confirmed"
+    assert result["qq"] == "8123456789"
 
 
 @pytest.mark.asyncio

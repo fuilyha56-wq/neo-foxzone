@@ -28,7 +28,7 @@ The detail path returns a structured comment tree when the QZone response contai
 
 ## Write methods
 
-Every write first queries a live login endpoint and requires it to match `[security].write_account_qq` (default `3693525299`). Unknown or ambiguous identity blocks the action.
+Every write first queries the framework account service or connected QQ Adapter for the live login identity. `[security].write_account_qq` is an optional extra account restriction; an unknown or ambiguous identity, or a mismatch with the configured restriction, blocks the action and automatic replies.
 
 ```python
 async def send_qzone_msg(

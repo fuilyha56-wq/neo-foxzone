@@ -161,7 +161,7 @@ class NeoFoxzoneService(BaseService):
     async def _require_write_identity(self, operation: str) -> int:
         """每次真实写操作都使用当前接口确认账号并比对安全配置。"""
         expected = str(self._config().security.write_account_qq).strip()
-        login = await get_current_login_info(expected_qq=expected)
+        login = await get_current_login_info(expected_qq=expected or None)
         if login.get("status") != "confirmed":
             reason = str(login.get("message") or "当前登录账号无法确认。")
             logger.warning(
@@ -195,7 +195,7 @@ class NeoFoxzoneService(BaseService):
     async def get_verified_write_account(self) -> int:
         """给后台任务读取当前账号；不把只读探测记录成真实写操作。"""
         expected = str(self._config().security.write_account_qq).strip()
-        login = await get_current_login_info(expected_qq=expected)
+        login = await get_current_login_info(expected_qq=expected or None)
         if login.get("status") != "confirmed":
             status = str(login.get("status") or "unknown")
             reason = str(login.get("message") or "当前登录账号无法确认。")
@@ -498,7 +498,7 @@ class NeoFoxzoneService(BaseService):
         """返回当前发现状态和真实登录账号校验状态，不执行写操作。"""
         snapshot = discover_qzone_provider(refresh=True)
         expected = str(self._config().security.write_account_qq).strip()
-        login = await get_current_login_info(expected_qq=expected)
+        login = await get_current_login_info(expected_qq=expected or None)
         return {
             "provider_available": snapshot.provider is not None,
             "provider": snapshot.source,

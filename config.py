@@ -48,13 +48,14 @@ class NeoFoxzoneConfig(BaseConfig):
 
     @config_section("security", title="写操作账号校验", tag="security")
     class SecuritySection(SectionBase):
-        """限制真实写操作必须使用明确配置的当前 Bot 账号。"""
+        """可选地限制真实写操作只能使用指定 Bot 账号。"""
 
         write_account_qq: str = Field(
-            default="3693525299",
+            default="",
             description=(
-                "真实写操作允许使用的 Bot QQ。每次发布、评论、点赞、删除、"
-                "权限和黑名单操作都会通过当前登录接口确认；未知或不匹配时拒绝。"
+                "可选的账号限制。留空时从框架账号 Service 或唯一已连接的 QQ Adapter "
+                "读取当前 Bot QQ；每次发布、评论、点赞、删除、权限和黑名单操作都会"
+                "通过实时登录接口确认，未知、多账号冲突或与此值不匹配时拒绝。"
             ),
         )
 

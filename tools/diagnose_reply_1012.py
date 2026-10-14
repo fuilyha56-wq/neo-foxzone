@@ -1,4 +1,4 @@
-"""只读检查 Neo FoxZone 运行时能力和 3693525299 登录状态。
+"""只读检查 Neo FoxZone 运行时能力和当前 Bot 登录状态。
 
 旧版本会假定 NapCat 监听端口，并发送真实评论来比较传输方式。该行为
 无法安全地自动化，因此此脚本现在只读取 Neo-MoFox 当前 Service、Adapter
@@ -15,8 +15,6 @@ import importlib
 
 providers = importlib.import_module("plugins.neo-foxzone.providers")
 
-TEST_BOT_QQ = "3693525299"
-
 
 def mask_qq(value: object) -> str:
     """仅显示账号首尾数字。"""
@@ -29,7 +27,7 @@ def mask_qq(value: object) -> str:
 async def main() -> int:
     """读取并打印当前进程可发现的协议能力和登录身份。"""
     snapshot = providers.discover_qzone_provider(refresh=True)
-    login = await providers.get_current_login_info(expected_qq=TEST_BOT_QQ)
+    login = await providers.get_current_login_info()
     print(f"QZone Provider: {snapshot.source or '未发现'}")
     print(f"诊断: {snapshot.diagnostic}")
     print(f"实时账号: {mask_qq(login.get('qq'))}")
