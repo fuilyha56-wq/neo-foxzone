@@ -23,6 +23,8 @@ from .tools import READ_TOOLS, WRITE_TOOLS
 from .feedback import ADAPTER_SIGNATURE, ActivityBridge, ActivityStore, QzoneActivityChatter, QzoneFeedbackAdapter
 
 logger = get_logger("neo_foxzone.plugin")
+IDENTITY_RETRY_INITIAL_SECONDS = 30.0
+IDENTITY_RETRY_MAX_SECONDS = 300.0
 
 
 def _interval_label(interval_seconds: float) -> str:
@@ -94,61 +96,79 @@ class NeoFoxzonePlugin(BasePlugin):
         if poller is None:
             return
         config = self._config().polling
+        retry_delay: float | None = None
+
+        async def run_check(label: str) -> bool:
+            """执行一轮检查并返回是否需要等待账号适配器就绪。"""
+            try:
+                report = await poller.poll_once()
+                logger.info(
+                    f"Neo FoxZone {label}完成: "
+                    f"候选={report.candidates}, 回复={report.replied}, "
+                    f"失败={report.failed}, 查询错误={len(report.query_errors)}"
+                )
+                for error in report.query_errors:
+                    logger.warning(f"Neo FoxZone {label}查询错误: {error}")
+                return bool(getattr(report, "retryable_identity_error", False))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(
+                    f"Neo FoxZone {label}异常: {error}",
+                    exc_info=error,
+                )
+                return False
+
         if config.startup_check:
             logger.info(
                 "Neo FoxZone 启动检查开始: "
                 "正在读取自身说说与好友动态并检查可回复评论。"
             )
-            try:
-                report = await poller.poll_once()
-                logger.info(
-                    "Neo FoxZone 启动检查完成: "
-                    f"候选={report.candidates}, 回复={report.replied}, "
-                    f"失败={report.failed}, 查询错误={len(report.query_errors)}"
-                )
-                for error in report.query_errors:
-                    logger.warning(f"Neo FoxZone 启动检查查询错误: {error}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.error(
-                    f"Neo FoxZone 启动检查异常: {error}",
-                    exc_info=error,
-                )
+            if await run_check("启动检查"):
+                retry_delay = IDENTITY_RETRY_INITIAL_SECONDS
         else:
             logger.info("Neo FoxZone 已按配置跳过启动检查。")
 
         while True:
-            interval_seconds = max(1.0, float(config.interval_minutes) * 60.0)
+            is_identity_retry = retry_delay is not None
+            interval_seconds = (
+                retry_delay
+                if is_identity_retry
+                else max(1.0, float(config.interval_minutes) * 60.0)
+            )
             interval = _interval_label(interval_seconds)
             next_run = datetime.now().astimezone() + timedelta(
                 seconds=interval_seconds
             )
-            logger.info(
-                f"Neo FoxZone 下次定时检查将在 {interval}后执行: "
-                f"预计时间={next_run:%Y-%m-%d %H:%M:%S %z}。"
-            )
+            if is_identity_retry:
+                logger.info(
+                    "Neo FoxZone 尚未确认 Bot QQ，将在 "
+                    f"{interval}后重试适配器连接: "
+                    f"预计时间={next_run:%Y-%m-%d %H:%M:%S %z}。"
+                )
+            else:
+                logger.info(
+                    f"Neo FoxZone 下次定时检查将在 {interval}后执行: "
+                    f"预计时间={next_run:%Y-%m-%d %H:%M:%S %z}。"
+                )
             await asyncio.sleep(interval_seconds)
             logger.info(
-                "Neo FoxZone 定时检查开始: "
+                "Neo FoxZone "
+                f"{'适配器就绪重试' if is_identity_retry else '定时检查'}开始: "
                 "正在读取自身说说与好友动态并检查可回复评论。"
             )
-            try:
-                report = await poller.poll_once()
-                logger.info(
-                    "Neo FoxZone 定时检查完成: "
-                    f"候选={report.candidates}, 回复={report.replied}, "
-                    f"失败={report.failed}, 查询错误={len(report.query_errors)}"
+            still_waiting = await run_check(
+                "适配器就绪重试" if is_identity_retry else "定时检查"
+            )
+            if still_waiting:
+                retry_delay = min(
+                    IDENTITY_RETRY_MAX_SECONDS,
+                    retry_delay * 2
+                    if is_identity_retry and retry_delay is not None
+                    else IDENTITY_RETRY_INITIAL_SECONDS,
                 )
-                for error in report.query_errors:
-                    logger.warning(f"Neo FoxZone 定时检查查询错误: {error}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.error(
-                    f"Neo FoxZone 定时检查异常: {error}",
-                    exc_info=error,
-                )
+            else:
+                retry_delay = None
 
     async def on_plugin_loaded(self) -> None:
         """加载持久状态并注册自动回复守护任务。"""

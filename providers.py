@@ -284,11 +284,17 @@ async def get_current_login_info(*, expected_qq: str | None = None) -> dict[str,
             "message": "当前账号接口返回多个不同 QQ，拒绝选择其中一个。",
         }
     if not unique:
+        message = "；".join(errors) or "没有可用于确认账号的实时接口。"
+        if not adapters:
+            message += (
+                "；未发现已连接的 QQ Adapter。请确认 OneBot Adapter 已启用、"
+                "完成登录并成功连接后再执行自动任务。"
+            )
         return {
             "status": "unknown",
             "qq": None,
             "sources": observed,
-            "message": "；".join(errors) or "没有可用于确认账号的实时接口。",
+            "message": message,
         }
 
     current_qq = next(iter(unique))

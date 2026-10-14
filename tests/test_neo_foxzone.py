@@ -725,6 +725,77 @@ async def test_write_is_blocked_when_login_account_is_unknown(
     assert backend.calls == []
 
 
+@pytest.mark.asyncio
+async def test_background_account_check_does_not_log_as_a_blocked_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """后台只读身份探测不应被误报成真实写操作。"""
+    _, service, _ = _build_runtime(monkeypatch)
+    warnings: list[str] = []
+
+    class FakeLogger:
+        def warning(self, message: str) -> None:
+            warnings.append(message)
+
+    async def unknown_login(*, expected_qq: str | None = None) -> dict[str, Any]:
+        del expected_qq
+        return {
+            "status": "unknown",
+            "qq": None,
+            "message": "未发现已连接的 QQ Adapter。",
+        }
+
+    monkeypatch.setattr(service_module, "logger", FakeLogger())
+    monkeypatch.setattr(service_module, "get_current_login_info", unknown_login)
+
+    with pytest.raises(service_module.AccountIdentityError, match="未发现已连接") as error:
+        await service.get_verified_write_account()
+
+    assert error.value.retryable is True
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_account_diagnostic_points_to_unconnected_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺少活跃 QQ Adapter 时给出可操作的连接提示。"""
+    monkeypatch.setattr(providers_module.service_api, "get_service", lambda _: None)
+    monkeypatch.setattr(providers_module.service_api, "get_all_services", lambda: {})
+    monkeypatch.setattr(providers_module.adapter_api, "get_all_adapters", lambda: {})
+
+    result = await providers_module.get_current_login_info(
+        expected_qq="3693525299"
+    )
+
+    assert result["status"] == "unknown"
+    assert "未发现已连接的 QQ Adapter" in result["message"]
+    assert "OneBot Adapter 已启用" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_poller_marks_unknown_login_as_retryable_identity_error() -> None:
+    """轮询报告保留账号不可用原因，并标记为可重试状态。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    message = "未发现已连接的 QQ Adapter。"
+
+    async def unknown_account() -> int:
+        raise service_module.AccountIdentityError(message, status="unknown")
+
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=NeoFoxzoneConfig()),
+        service=object(),
+        state=state_module.PollingState(),
+        bot_uin_loader=unknown_account,
+    )
+
+    report = await poller.poll_once()
+
+    assert report.retryable_identity_error is True
+    assert message in report.query_errors[0]
+
+
 def test_content_normalization_blocks_cq_injection_and_caps_length(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2286,6 +2357,56 @@ async def test_poll_loop_survives_startup_check_exception(
         for message in messages
     )
     assert any("定时检查开始" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_retries_identity_readiness_before_regular_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未确认 Bot QQ 时短退避重试，连接就绪后恢复配置间隔。"""
+    plugin = NeoFoxzonePlugin(config=NeoFoxzoneConfig())
+    poller = SimpleNamespace(calls=0)
+
+    async def poll_once() -> Any:
+        poller.calls += 1
+        return SimpleNamespace(
+            candidates=0,
+            replied=0,
+            failed=0,
+            query_errors=["Bot QQ 尚未确认"] if poller.calls == 1 else [],
+            retryable_identity_error=poller.calls == 1,
+        )
+
+    poller.poll_once = poll_once
+    plugin._poller = poller  # type: ignore[assignment]
+    messages: list[str] = []
+    sleeps: list[float] = []
+
+    class FakeLogger:
+        def info(self, message: str) -> None:
+            messages.append(message)
+
+        def warning(self, message: str) -> None:
+            messages.append(message)
+
+        def error(self, message: str, **kwargs: Any) -> None:
+            messages.append(message)
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin_module, "logger", FakeLogger())
+    monkeypatch.setattr(plugin_module.asyncio, "sleep", record_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await plugin._run_poll_loop()
+
+    assert poller.calls == 2
+    assert sleeps == [30.0, 1800.0]
+    assert any("30 秒后重试适配器连接" in message for message in messages)
+    assert any("适配器就绪重试开始" in message for message in messages)
 
 
 @pytest.mark.asyncio

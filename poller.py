@@ -188,6 +188,7 @@ class PollReport:
     skipped_backoff: int = 0
     replied: int = 0
     failed: int = 0
+    retryable_identity_error: bool = False
     query_errors: list[str] = field(default_factory=list)
     reply_errors: list[str] = field(default_factory=list)
     state_errors: list[str] = field(default_factory=list)
@@ -770,7 +771,10 @@ class QzoneReplyPoller:
         try:
             bot_uin = await self._bot_uin_loader()
         except Exception as error:
-            report.query_errors.append(f"Bot QQ 获取失败: {type(error).__name__}")
+            report.retryable_identity_error = bool(
+                getattr(error, "retryable", False)
+            )
+            report.query_errors.append(f"Bot QQ 获取失败: {error}")
             return []
         if self.state.rate_limit_cooldown_active():
             return []
@@ -788,6 +792,9 @@ class QzoneReplyPoller:
             try:
                 bot_uin = await self._bot_uin_loader()
             except Exception as error:
+                report.retryable_identity_error = bool(
+                    getattr(error, "retryable", False)
+                )
                 report.query_errors.append(f"Bot QQ 获取失败: {error}")
                 logger.warning(
                     f"Bot QQ 获取失败: {error}；"

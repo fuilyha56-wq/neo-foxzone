@@ -75,6 +75,15 @@ class NeoFoxzoneError(RuntimeError):
     """Neo FoxZone 无法执行调用时抛出的业务异常。"""
 
 
+class AccountIdentityError(NeoFoxzoneError):
+    """后台任务无法从当前在线接口确认 Bot QQ。"""
+
+    def __init__(self, message: str, *, status: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retryable = status == "unknown"
+
+
 class NeoFoxzoneService(BaseService):
     """经运行时发现的协议端暴露 QQ 空间说说能力。"""
 
@@ -184,8 +193,23 @@ class NeoFoxzoneService(BaseService):
             _LAST_WRITE_STARTED = time.monotonic()
 
     async def get_verified_write_account(self) -> int:
-        """供后台自动任务使用；未通过账号校验时抛出异常并跳过任务。"""
-        return await self._require_write_identity("automatic task")
+        """给后台任务读取当前账号；不把只读探测记录成真实写操作。"""
+        expected = str(self._config().security.write_account_qq).strip()
+        login = await get_current_login_info(expected_qq=expected)
+        if login.get("status") != "confirmed":
+            status = str(login.get("status") or "unknown")
+            reason = str(login.get("message") or "当前登录账号无法确认。")
+            raise AccountIdentityError(
+                f"无法确认自动任务使用的 Bot QQ：{reason}",
+                status=status,
+            )
+        try:
+            return int(str(login["qq"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise AccountIdentityError(
+                "无法确认自动任务使用的 Bot QQ：实时登录接口未返回有效 QQ。",
+                status="unknown",
+            ) from error
 
     @staticmethod
     def _post_owner(detail: dict[str, Any]) -> int | None:
@@ -482,6 +506,7 @@ class NeoFoxzoneService(BaseService):
             "service_signatures": list(snapshot.service_signatures),
             "adapter_signatures": list(snapshot.adapter_signatures),
             "account_status": login.get("status", "unknown"),
+            "account_diagnostic": login.get("message", ""),
             "account_qq": self._mask_qq(login.get("qq")),
             "expected_account_qq": self._mask_qq(expected),
             "write_allowed": (
