@@ -121,7 +121,17 @@ class NeoFoxzoneConfig(BaseConfig):
         )
         friend_feeds_count: int = Field(
             default=20,
-            description="每轮检查好友动态的数量。",
+            description="每页检查好友动态的数量。",
+        )
+        friend_feed_pages: int = Field(
+            default=3,
+            ge=1,
+            le=20,
+            description="每轮读取好友动态页数；增加页数可检查更早的历史说说。",
+        )
+        friend_post_replies_enabled: bool = Field(
+            default=True,
+            description="允许模型判断是否在好友说说下发表评论；每条说说只处理一次。",
         )
         max_replies_per_poll: int = Field(
             default=5,

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from .core.llm.vision import image_references
 
-ReplySource = Literal["own_post", "friend_feed"]
+ReplySource = Literal["own_post", "friend_feed", "friend_post"]
 
 _OWN_POST_COMMENT_KEYS = (
     "commentlist",
@@ -42,6 +42,8 @@ class ReplyCandidate:
     parent_content: str
     target_uin: int | None
     post_images: tuple[str, ...] = ()
+    bot_already_replied: bool = False
+    recent_comments: tuple[str, ...] = ()
 
     @property
     def identity(self) -> str:
@@ -227,6 +229,7 @@ def _build_candidate(
     root_comment_id: str | None,
     detail_verified: bool,
     target_uin: int | None,
+    bot_already_replied: bool = False,
 ) -> ReplyCandidate | None:
     """从已通过安全判据的原始对象构造候选。"""
     post_id = _string_value(post, ("tid", "key", "id", "feedskey"))
@@ -251,6 +254,7 @@ def _build_candidate(
         parent_content=_comment_content(parent or {}),
         target_uin=target_uin,
         post_images=tuple(image_references(post)),
+        bot_already_replied=bot_already_replied,
     )
 
 
@@ -268,12 +272,37 @@ def _root_comment_id(graph: _CommentGraph, comment_id: str) -> str | None:
         current_id = parent_id
 
 
+def _bot_replied_to_comment(
+    graph: _CommentGraph,
+    comment_id: str,
+    bot_uin: int,
+) -> bool:
+    """检查 Bot 是否直接跟进该评论，兼容平铺的楼中楼结构。"""
+    comment = graph.by_id.get(comment_id)
+    if comment is None:
+        return False
+    commenter_uin = _comment_uin(comment)
+    root_id = _root_comment_id(graph, comment_id)
+    for bot_comment_id, bot_comment in graph.by_id.items():
+        if _comment_uin(bot_comment) != bot_uin:
+            continue
+        if graph.parent_by_id.get(bot_comment_id) == comment_id:
+            return True
+        if (
+            root_id is not None
+            and _reply_to_uin(bot_comment) == commenter_uin
+            and _root_comment_id(graph, bot_comment_id) == root_id
+        ):
+            return True
+    return False
+
+
 def _own_post_candidates(
     posts: list[dict[str, Any]],
     bot_uin: int,
     detail_verified: bool,
 ) -> list[ReplyCandidate]:
-    """找出自己说说中线程末尾尚未被 Bot 回复的评论。"""
+    """找出自己说说中的评论，并标出已有 Bot 回复的线程。"""
     candidates: list[ReplyCandidate] = []
     for post in posts:
         graph = _build_comment_graph(post, "own_post")
@@ -281,11 +310,11 @@ def _own_post_candidates(
             comment = graph.by_id[comment_id]
             if _comment_uin(comment) in {0, bot_uin}:
                 continue
-            if any(
-                _comment_uin(child) == bot_uin
-                for child in graph.children_by_parent.get(comment_id, [])
-            ):
-                continue
+            bot_already_replied = _bot_replied_to_comment(
+                graph,
+                comment_id,
+                bot_uin,
+            )
             parent_id = graph.parent_by_id.get(comment_id)
             candidate = _build_candidate(
                 source="own_post",
@@ -297,6 +326,7 @@ def _own_post_candidates(
                 root_comment_id=_root_comment_id(graph, comment_id),
                 detail_verified=detail_verified,
                 target_uin=None,
+                bot_already_replied=bot_already_replied,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -310,7 +340,7 @@ def _friend_feed_candidates(
     known_bot_comment_roots: dict[str, dict[str, str]],
     detail_verified: bool,
 ) -> list[ReplyCandidate]:
-    """找出好友说说中可证明为直接回复 Bot 的未处理评论。"""
+    """找出好友说说中直接回复 Bot 的评论，并标注已有跟进。"""
     candidates: list[ReplyCandidate] = []
     for post in feeds:
         owner_uin = _int_value(post, ("uin", "user_id", "owner_uin", "ownerUin"))
@@ -336,11 +366,11 @@ def _friend_feed_candidates(
             ) or _reply_to_uin(comment) == bot_uin
             if not directly_replies_to_bot:
                 continue
-            if any(
-                _comment_uin(reply) == bot_uin
-                for reply in graph.children_by_parent.get(comment_id, [])
-            ):
-                continue
+            bot_already_replied = _bot_replied_to_comment(
+                graph,
+                comment_id,
+                bot_uin,
+            )
             root_comment_id = _root_comment_id(graph, comment_id)
             if root_comment_id is None and parent_id in bot_comment_ids:
                 persisted_root = str(persisted_roots.get(parent_id, "")).strip()
@@ -357,9 +387,84 @@ def _friend_feed_candidates(
                 root_comment_id=root_comment_id,
                 detail_verified=detail_verified,
                 target_uin=owner_uin,
+                bot_already_replied=bot_already_replied,
             )
             if candidate is not None:
                 candidates.append(candidate)
+    return candidates
+
+
+def extract_friend_post_candidates(
+    response: dict[str, Any],
+    *,
+    bot_uin: int,
+    known_bot_comment_ids: dict[str, set[str]] | None = None,
+    detail_verified: bool = False,
+) -> list[ReplyCandidate]:
+    """为好友说说本身构造候选，并带上 Bot 回复标签和评论上下文。"""
+    if bot_uin <= 0 or not isinstance(response, dict):
+        return []
+    data = response.get("data")
+    payload = data if isinstance(data, dict) else response
+    feeds = _as_dict_list(payload.get("feeds"))
+    known_comments = known_bot_comment_ids or {}
+    candidates: list[ReplyCandidate] = []
+    for post in feeds:
+        app_id = str(post.get("appid", "")).strip()
+        if app_id and app_id != "311":
+            continue
+        owner_uin = _int_value(post, ("uin", "user_id", "owner_uin", "ownerUin"))
+        post_id = _string_value(post, ("tid", "key", "id", "feedskey"))
+        if owner_uin <= 0 or owner_uin == bot_uin or not post_id:
+            continue
+        post_content = _string_value(post, ("content", "text", "summary"))
+        images = tuple(image_references(post))
+        if not post_content and not images:
+            continue
+
+        graph = _build_comment_graph(post, "friend_feed")
+        post_key = f"{owner_uin}:{post_id}"
+        bot_comment_ids = {
+            comment_id
+            for comment_id, item in graph.by_id.items()
+            if _comment_uin(item) == bot_uin
+        }
+        bot_already_replied = bool(
+            bot_comment_ids or known_comments.get(post_key)
+        )
+        recent_comments: list[str] = []
+        for comment_id in graph.ordered_ids[-20:]:
+            comment = graph.by_id[comment_id]
+            content = _comment_content(comment)
+            if not content:
+                continue
+            author = (
+                "Bot"
+                if _comment_uin(comment) == bot_uin
+                else _string_value(comment, ("nickname", "name", "nick")) or "好友"
+            )
+            recent_comments.append(f"{author}: {content[:300]}")
+
+        candidates.append(
+            ReplyCandidate(
+                source="friend_post",
+                post_id=post_id,
+                post_owner_uin=owner_uin,
+                post_content=post_content,
+                comment_id="post",
+                commenter_uin=owner_uin,
+                commenter_name=_string_value(post, ("nickname", "name", "nick")),
+                comment_content="",
+                parent_comment_id=None,
+                root_comment_id=None,
+                detail_verified=detail_verified,
+                parent_content="",
+                target_uin=owner_uin,
+                post_images=images,
+                bot_already_replied=bot_already_replied,
+                recent_comments=tuple(recent_comments),
+            )
+        )
     return candidates
 
 
@@ -390,4 +495,9 @@ def extract_reply_candidates(
     ]
 
 
-__all__ = ["ReplyCandidate", "ReplySource", "extract_reply_candidates"]
+__all__ = [
+    "ReplyCandidate",
+    "ReplySource",
+    "extract_friend_post_candidates",
+    "extract_reply_candidates",
+]

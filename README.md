@@ -1,6 +1,8 @@
 # Neo FoxZone
 
-Neo FoxZone 是 Neo-MoFox 的 QQ 空间插件。它发现当前可用的 QZone Service 或已连接的 QQ Adapter，提供说说读取、发布、评论和反馈轮询。当前插件版本：**0.1.7**。
+Neo FoxZone 是 Neo-MoFox 的 QQ 空间插件。它发现当前可用的 QZone Service 或已连接的 QQ Adapter，提供说说读取、发布、评论和反馈轮询。当前插件版本：**0.1.8**。
+
+自动回复轮询可以检查 Bot 自己最近的说说评论，以及好友动态分页中的评论和好友说说。好友说说正文、图片、评论上下文和“Bot已回复”标签会交给配置的 LLM；模型决定回复时，插件在对应好友说说下发表评论，决定跳过时会持久化该决策，避免每轮重复判断同一条历史说说。每条说说只处理一次；新评论仍按评论 ID 单独处理。
 
 ## 新评论如何交给 MoFox
 
@@ -51,6 +53,9 @@ startup_check = true
 interval_minutes = 30.0
 model_task = "utils_small"
 max_replies_per_poll = 5
+friend_feeds_count = 20
+friend_feed_pages = 3
+friend_post_replies_enabled = true
 
 [feedback]
 enabled = true
@@ -69,7 +74,7 @@ multimodal_mode = false
 
 从旧版本升级且此项保留了旧默认账号、但与当前登录 QQ 不同的用户，可以清空此项以启用自动识别。
 
-`polling.model_task` 选择自动回复模型任务；评论活动进入核心消息链后，由 MoFox 的 Chatter 和 LLM 决定是否回复。核心任务使用 `[llm].model_task`。`vision_model_task` 控制图片理解；设为空值会关闭视觉理解。直接向支持图片的模型发送图片需启用 `multimodal_mode`。
+`polling.model_task` 选择自动回复模型任务。`friend_feed_pages` 控制每轮检查的好友动态页数，较大的页码包含更早的历史说说；`friend_post_replies_enabled` 控制是否让 LLM 判断并评论好友说说。评论活动转交 MoFox 核心消息链的独立反馈功能由 `[feedback]` 配置，Chatter 和 LLM 会另行决定是否回复。核心主动发布任务使用 `[llm].model_task`。`vision_model_task` 控制图片理解；设为空值会关闭视觉理解。直接向支持图片的模型发送图片需启用 `multimodal_mode`。
 
 独立自治流程由 `[general].enabled` 控制，默认关闭。反馈队列与自治流程是分开的开关；可分别配置自身评论、好友动态和外部接力的间隔、年龄与次数限制。
 

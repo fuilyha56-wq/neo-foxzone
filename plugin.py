@@ -40,7 +40,7 @@ class NeoFoxzonePlugin(BasePlugin):
 
     plugin_name = "neo-foxzone"
     plugin_description = "自动发现兼容 QZone Service 或 OneBot Adapter 的 QQ 空间插件"
-    plugin_version = "0.1.7"
+    plugin_version = "0.1.8"
     configs = [NeoFoxzoneConfig]
     # 协议端在运行时发现，缺少 OneBot Expand 不阻止插件注册。
     dependencies: list[str] = []
@@ -215,7 +215,9 @@ class NeoFoxzonePlugin(BasePlugin):
                 f"启动检查={config.polling.startup_check}, "
                 f"间隔={config.polling.interval_minutes:g} 分钟, "
                 f"自身说说={config.polling.own_posts_count} 条, "
-                f"好友动态={config.polling.friend_feeds_count} 条, "
+                f"好友动态={config.polling.friend_feeds_count} 条/页, "
+                f"历史页数={config.polling.friend_feed_pages}, "
+                f"好友说说评论={'启用' if config.polling.friend_post_replies_enabled else '禁用'}, "
                 f"单轮最多回复={config.polling.max_replies_per_poll} 条, "
                 f"任务ID={task.task_id}。"
             )

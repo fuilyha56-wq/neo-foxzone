@@ -1,7 +1,7 @@
 {
   "name": "neo-foxzone",
   "display_name": "Neo-FoxZone",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "可自动发现 QQ 空间 Service 或 OneBot Adapter 的说说插件，协议端为可选能力",
   "author": "Lycoris-flower",
   "license": "AGPL-3.0",

@@ -130,3 +130,9 @@ Components: `neo-foxzone:adapter:qzone_feedback` (platform `qzone`) and `neo-fox
 The plugin persists `neo-foxzone/feedback_state` before delivery, acknowledges decisions separately from writes, and never automatically replays an unknown platform write. Outgoing text requires the exact incoming activity message ID as reply reference and the matching thread. The target comment is verified again against fresh detail.
 
 `describe_images(references)` uses configured vision models and validated image data; tool `neo_foxzone_describe_images` and command `vision` return successful descriptions only. Generated content inherits core personality by default. Story, comment, and vision tasks are independently configurable. Direct multimodal requests preserve index association and are split at nine images.
+
+## Automatic reply polling
+
+`[polling].friend_feed_pages` controls how many `get_qzone_feeds(page_num, count)` pages are scanned each round. The default is three pages, with the existing `friend_feeds_count` setting as the page size. The protocol's pagination determines how far back those pages reach; this is a bounded history scan, not an unlimited archive.
+
+When `[polling].friend_post_replies_enabled` is on, structured friend posts become LLM candidates in addition to comments that directly reply to Bot. The prompt includes the post text, recent structured comments, images when supported, and a `Bot已回复` tag when the post already contains a Bot comment. The model may return `[NO_REPLY]`; that decision is persisted for the post. If it returns comment text, the plugin uses the verified `comment_qzone` path with the feed's author QQ. A successful comment is stored in the plugin's Bot-comment state. Existing comment-thread candidates also carry the `Bot已回复` flag instead of being filtered before model review.

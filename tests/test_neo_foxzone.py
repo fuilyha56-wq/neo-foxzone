@@ -672,7 +672,7 @@ def test_plugin_registers_service_command_and_tools() -> None:
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.7"
+    assert plugin.plugin_version == "0.1.8"
     assert plugin.dependencies == []
     assert plugin.config.plugin.version == "0.1.7"
 
@@ -702,7 +702,7 @@ def test_manifest_keeps_protocol_plugins_optional() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.7"
+    assert manifest["version"] == "0.1.8"
     assert manifest["dependencies"]["plugins"] == []
     assert manifest["dependencies"]["components"] == []
     assert manifest["dependencies_required"] is False
@@ -1223,8 +1223,8 @@ async def test_image_provider_timeout_prevents_partial_publish(
         await image_provider_module.generate_images(config, "慢速图片", "drawing")
 
 
-def test_feed_parser_selects_only_unanswered_recoverable_comments() -> None:
-    """解析器只应产出尚未被 Bot 回复且具备明确回复关系的评论。"""
+def test_feed_parser_selects_recoverable_comments_and_marks_bot_replies() -> None:
+    """解析器保留已被 Bot 回复的评论并为 LLM 标记状态。"""
     parser_module = importlib.import_module(f"{PACKAGE}.feed_parser")
     extract_reply_candidates = parser_module.extract_reply_candidates
     response = {
@@ -1288,10 +1288,12 @@ def test_feed_parser_selects_only_unanswered_recoverable_comments() -> None:
 
     assert [(item.post_id, item.comment_id) for item in candidates] == [
         ("own-post", "c1"),
+        ("own-post", "c2"),
         ("friend-post", "c4"),
     ]
+    assert [item.bot_already_replied for item in candidates] == [False, True, False]
     assert candidates[0].target_uin is None
-    assert candidates[1].target_uin == 20001
+    assert candidates[2].target_uin == 20001
 
 
 def test_feed_parser_recovers_thread_root_for_persisted_bot_comment() -> None:
@@ -1383,7 +1385,7 @@ def test_feed_parser_rejects_ambiguous_comment_fields() -> None:
 
 
 def test_feed_parser_rebuilds_flat_parent_graph_before_replying() -> None:
-    """平铺评论中已有 Bot 直接子回复时不得再次选为候选。"""
+    """平铺评论中已有 Bot 回复时仍作为带标签的 LLM 候选。"""
     parser_module = importlib.import_module(f"{PACKAGE}.feed_parser")
     candidates = parser_module.extract_reply_candidates(
         {
@@ -1438,7 +1440,10 @@ def test_feed_parser_rebuilds_flat_parent_graph_before_replying() -> None:
         bot_uin=99999,
     )
 
-    assert candidates == []
+    assert [(item.source, item.comment_id, item.bot_already_replied) for item in candidates] == [
+        ("own_post", "own-user", True),
+        ("friend_feed", "friend-user-reply", True),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1803,7 +1808,7 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
     assert len(snapshots) == 2
     assert any(
         "评论ID=new-comment" in message
-        and "决策=生成并发送回复" in message
+        and "决策=调用 LLM 判断是否回复" in message
         for message in messages
     )
     assert any(
@@ -1906,7 +1911,7 @@ async def test_poller_logs_query_shape_and_safe_skip_decision(
     )
     assert any(
         "协议返回预渲染 HTML" in message
-        and "决策=不回复" in message
+        and "详情未能补全" in message
         for message in messages
     )
     assert any("本轮没有可安全回复的评论候选" in message for message in messages)
@@ -3050,7 +3055,7 @@ async def test_poller_jitters_between_sends(
 async def test_poller_enriches_html_friend_feeds_via_detail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SnowLuma 好友动态只有预渲染 html 时，也必须发起详情补全。
+    """分页历史中的好友说说经详情补全后交给 LLM 并可直接评论。
 
     回归背景：好友动态条目没有任何结构化评论字段时曾被直接跳过，
     导致好友说说下的评论永远不会被发现（可回复候选恒为 0）。
@@ -3058,7 +3063,8 @@ async def test_poller_enriches_html_friend_feeds_via_detail(
     poller_module = importlib.import_module(f"{PACKAGE}.poller")
     state_module = importlib.import_module(f"{PACKAGE}.polling_state")
     detail_calls: list[tuple[str, int]] = []
-    reply_calls: list[dict[str, Any]] = []
+    feed_pages: list[int] = []
+    comment_calls: list[dict[str, Any]] = []
 
     async def save_json(*args: Any, **kwargs: Any) -> None:
         """避免测试写入实际插件状态。"""
@@ -3086,6 +3092,7 @@ async def test_poller_enriches_html_friend_feeds_via_detail(
             return {"status": "ok", "retcode": 0, "data": {"msglist": []}}
 
         async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            feed_pages.append(kwargs["page_num"])
             return {
                 "status": "ok",
                 "retcode": 0,
@@ -3123,6 +3130,13 @@ async def test_poller_enriches_html_friend_feeds_via_detail(
                     "content": "好友说说正文",
                     "commentlist": [
                         {
+                            "comment_id": "bot-comment-1",
+                            "uin": 99999,
+                            "nickname": "Bot",
+                            "content": "Bot 之前的评论",
+                            "list_3": [],
+                        },
+                        {
                             "comment_id": "friend-comment-1",
                             "uin": 3893256464,
                             "nickname": "评论者",
@@ -3134,15 +3148,21 @@ async def test_poller_enriches_html_friend_feeds_via_detail(
             }
 
         async def reply_qzone_comment(self, **kwargs: Any) -> dict[str, Any]:
-            reply_calls.append(kwargs)
+            raise AssertionError("好友说说本身应发表评论，不应走楼中楼回复。")
+
+        async def comment_qzone(self, **kwargs: Any) -> dict[str, Any]:
+            comment_calls.append(kwargs)
             return {
                 "status": "ok",
                 "retcode": 0,
-                "data": {"comment_id": "bot-thread-reply"},
+                "data": {"comment_id": "bot-post-comment"},
             }
 
     async def generate_reply(candidate: Any) -> str:
-        """返回固定回复。"""
+        """确认 LLM 收到历史状态标签后生成固定回复。"""
+        assert candidate.source == "friend_post"
+        assert candidate.bot_already_replied is True
+        assert "Bot: Bot 之前的评论" in candidate.recent_comments
         return "谢谢关注"
 
     poller = poller_module.QzoneReplyPoller(
@@ -3155,12 +3175,81 @@ async def test_poller_enriches_html_friend_feeds_via_detail(
 
     report = await poller.poll_once()
 
-    # appid=311 的 html 好友动态必须触发详情补全；appid=6600 的广告跳过。
+    # 多页动态去重后只详情查询一次；appid=6600 的广告跳过。
+    assert feed_pages == [1, 2, 3]
     assert detail_calls == [("friend-post-1", 2295127191)]
-    # 详情返回的是好友自己顶层评论（非回复 bot 的评论），不会生成候选；
-    # 这里验证的是详情链路打通而非回复行为。
-    assert report.candidates == 0
-    assert reply_calls == []
+    assert report.candidates == 1
+    assert report.replied == 1
+    assert comment_calls == [
+        {
+            "tid": "friend-post-1",
+            "target_uin": 2295127191,
+            "content": "谢谢关注",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poller_persists_model_no_reply_decision_for_friend_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM 选择不回复时保存状态，后续轮询不重复调用模型。"""
+    poller_module = importlib.import_module(f"{PACKAGE}.poller")
+    state_module = importlib.import_module(f"{PACKAGE}.polling_state")
+    generated: list[str] = []
+    comment_calls: list[dict[str, Any]] = []
+
+    async def save_json(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(state_module.storage_api, "save_json", save_json)
+
+    class SummaryFeedService:
+        async def get_qzone_msg_list(self, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "ok", "retcode": 0, "data": {"msglist": []}}
+
+        async def get_qzone_feeds(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "feeds": [
+                        {
+                            "appid": "311",
+                            "uin": 20001,
+                            "key": "friend-post-skip",
+                            "nickname": "好友",
+                            "content": "一条无需回应的动态",
+                        }
+                    ]
+                },
+            }
+
+        async def comment_qzone(self, **kwargs: Any) -> dict[str, Any]:
+            comment_calls.append(kwargs)
+            return {"status": "ok", "retcode": 0, "data": {}}
+
+    async def generate_reply(candidate: Any) -> str:
+        generated.append(candidate.identity)
+        return "[NO_REPLY]"
+
+    config = NeoFoxzoneConfig()
+    config.polling.friend_feed_pages = 1
+    poller = poller_module.QzoneReplyPoller(
+        NeoFoxzonePlugin(config=config),
+        service=SummaryFeedService(),
+        state=state_module.PollingState(),
+        reply_generator=generate_reply,
+        bot_uin_loader=lambda: asyncio.sleep(0, result=99999),
+    )
+
+    first = await poller.poll_once()
+    second = await poller.poll_once()
+
+    assert first.skipped_by_model == 1
+    assert first.replied == second.replied == 0
+    assert generated == ["friend_post:20001:friend-post-skip:post"]
+    assert comment_calls == []
 
 
 @pytest.mark.asyncio
