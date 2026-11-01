@@ -899,19 +899,23 @@ class NeoFoxzoneService(BaseService):
         target_uin: int | None = None,
         images: list[str] | None = None,
     ) -> QzoneResponse:
-        """对指定说说发表评论，可附带图片。"""
+        """对他人的说说发表评论；自己说说中的评论走楼中楼回复入口。"""
         current_qq = await self._require_write_identity("comment")
+        normalized_tid = self._validate_tid(tid)
+        normalized_target = self._validate_user_id(
+            target_uin if target_uin is not None else current_qq,
+            "target_uin",
+        )
+        if normalized_target == current_qq:
+            raise NeoFoxzoneError(
+                "不能直接评论自己的说说；回复其中的评论请使用楼中楼回复。"
+            )
         normalized_images = await self._normalize_images(images)
         normalized_content = self._normalize_content(content, "评论正文")
         if not normalized_content:
             if not normalized_images:
                 raise NeoFoxzoneError("评论正文与图片不能同时为空。")
             raise NeoFoxzoneError("当前 OneBot 后端要求评论正文不能为空。")
-        normalized_tid = self._validate_tid(tid)
-        normalized_target = self._validate_user_id(
-            target_uin if target_uin is not None else current_qq,
-            "target_uin",
-        )
         await self._verified_post_detail(normalized_tid, normalized_target)
         self._log_write_context(
             "comment",
@@ -1175,7 +1179,10 @@ class NeoFoxzoneService(BaseService):
         return list(detail.get("comments", [])) if detail else []
 
     async def get_monitor_feeds(self, num: int = 10) -> list[dict[str, Any]]:
-        """读取结构化好友动态，不从预渲染 HTML 猜测评论关系。"""
+        """读取他人的结构化好友动态，补全详情前排除当前账号的说说。"""
+        self_uin = await self._load_self_uin()
+        if self_uin is None:
+            return []
         try:
             response = await self.get_qzone_feeds(page_num=1, count=max(1, int(num)))
         except (NeoFoxzoneError, ValueError, TypeError):
@@ -1196,6 +1203,8 @@ class NeoFoxzoneService(BaseService):
                 continue
             feed = self._legacy_feed(raw_feed)
             if not feed["tid"] or not feed["target_qq"]:
+                continue
+            if feed["target_qq"] == str(self_uin):
                 continue
             # SnowLuma timeline 的 html 只是摘要，ID 与作者来自明确字段。
             # 通过详情接口补全正文、图片和评论树，不从 HTML 猜测关系。

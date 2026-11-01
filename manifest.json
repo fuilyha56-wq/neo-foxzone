@@ -1,156 +1,176 @@
 {
-  "name": "neo-foxzone",
-  "display_name": "Neo-FoxZone",
-  "version": "0.1.8",
-  "description": "可自动发现 QQ 空间 Service 或 OneBot Adapter 的说说插件，协议端为可选能力",
-  "author": "Lycoris-flower",
-  "license": "AGPL-3.0",
-  "dependencies": {
-    "plugins": [],
-    "components": []
-  },
-  "include": [
-    {"component_type": "adapter", "component_name": "qzone_feedback", "dependencies": ["neo-foxzone:service:qzone_service"], "enabled": true},
-    {"component_type": "chatter", "component_name": "qzone_activity", "dependencies": ["neo-foxzone:service:qzone_service"], "enabled": true},
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_describe_images",
-      "dependencies": ["neo-foxzone:service:qzone_service"],
-      "enabled": true
+    "name": "neo-foxzone",
+    "display_name": "Neo-FoxZone",
+    "version": "0.1.9",
+    "description": "可自动发现 QQ 空间 Service 或 OneBot Adapter 的说说插件，协议端为可选能力",
+    "author": "Lycoris-flower",
+    "license": "AGPL-3.0",
+    "dependencies": {
+        "plugins": [],
+        "components": []
     },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_read_detail",
-      "dependencies": ["neo-foxzone:service:qzone_service"],
-      "enabled": true
+    "include": [
+        {
+            "component_type": "adapter",
+            "component_name": "qzone_feedback",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "chatter",
+            "component_name": "qzone_activity",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_describe_images",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_read_detail",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_reply_comment",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "service",
+            "component_name": "qzone_service",
+            "dependencies": [],
+            "enabled": true
+        },
+        {
+            "component_type": "command",
+            "component_name": "neo-foxzone",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_list_posts",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_list_feeds",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_publish",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_publish_generated",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_delete",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_like",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_unlike",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_comment",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_set_blacklist",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "neo_foxzone_set_visibility",
+            "dependencies": [
+                "neo-foxzone:service:qzone_service"
+            ],
+            "enabled": true
+        },
+        {
+            "component_type": "config",
+            "component_name": "config",
+            "dependencies": [],
+            "enabled": true
+        }
+    ],
+    "entry_point": "plugin.py",
+    "api_version": {
+        "config_api": "1.0.0",
+        "llm_api": "1.0.0",
+        "service_api": "1.0.0",
+        "storage_api": "1.0.0"
     },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_reply_comment",
-      "dependencies": ["neo-foxzone:service:qzone_service"],
-      "enabled": true
-    },
-    {
-      "component_type": "service",
-      "component_name": "qzone_service",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "command",
-      "component_name": "neo-foxzone",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_list_posts",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_list_feeds",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_publish",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_publish_generated",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_delete",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_like",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_unlike",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_comment",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_set_blacklist",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "neo_foxzone_set_visibility",
-      "dependencies": [
-        "neo-foxzone:service:qzone_service"
-      ],
-      "enabled": true
-    },
-    {
-      "component_type": "config",
-      "component_name": "config",
-      "dependencies": [],
-      "enabled": true
-    }
-  ],
-  "entry_point": "plugin.py",
-  "api_version": {
-    "config_api": "1.0.0",
-    "llm_api": "1.0.0",
-    "service_api": "1.0.0",
-    "storage_api": "1.0.0"
-  },
-  "min_core_version": "1.0.0",
-  "python_dependencies": [],
-  "dependencies_required": false,
-  "categories": [
-    "tool"
-  ],
-  "tags": [
-    "qq",
-    "qzone",
-    "说说",
-    "onebot",
-    "onebot-expand",
-    "napcat",
-    "snowluma"
-  ]
+    "min_core_version": "1.0.0",
+    "python_dependencies": [],
+    "dependencies_required": false,
+    "categories": [
+        "tool"
+    ],
+    "tags": [
+        "qq",
+        "qzone",
+        "说说",
+        "onebot",
+        "onebot-expand",
+        "napcat",
+        "snowluma"
+    ]
 }

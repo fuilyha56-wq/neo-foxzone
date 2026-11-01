@@ -558,6 +558,98 @@ async def test_legacy_service_facade_filters_reads_and_uses_shared_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_field", "owner"),
+    [("uin", 3693525299), ("target_qq", "3693525299"), ("host_uin", " 3693525299 ")],
+)
+async def test_monitor_feeds_exclude_own_posts_before_detail_enrichment(
+    monkeypatch: pytest.MonkeyPatch, owner_field: str, owner: int | str,
+) -> None:
+    """自己的正文和 HTML 动态均不能占用好友详情名额或进入模型候选。"""
+    plugin, service, _ = _build_runtime(monkeypatch)
+    plugin.config.monitor.max_decisions_per_cycle = 1
+    detail_calls: list[tuple[str, str]] = []
+
+    async def feeds(**kwargs: Any) -> dict[str, Any]:
+        return {"status": "ok", "retcode": 0, "data": {"feeds": [
+            {"tid": "own-text", owner_field: owner, "content": "自己的说说"},
+            {"tid": "own-html", owner_field: owner, "html": "<div>自己的摘要</div>"},
+            {"tid": "friend-html", "uin": 20001, "html": "<div>好友摘要</div>"},
+        ]}}
+
+    async def detail(host_qq: str, feed_id: str) -> dict[str, Any]:
+        detail_calls.append((host_qq, feed_id))
+        return {"tid": feed_id, "target_qq": host_qq, "uin": host_qq,
+                "content": "好友的说说", "comments": [], "liked": False}
+
+    async def save() -> None:
+        pass
+
+    monkeypatch.setattr(service, "get_qzone_feeds", feeds)
+    monkeypatch.setattr(service, "get_feed_detail", detail)
+    monkeypatch.setattr(plugin.runtime.interaction_log, "save", save)
+
+    result = await service.get_monitor_feeds()
+
+    assert [feed["tid"] for feed in result] == ["friend-html"]
+    assert detail_calls == [("20001", "friend-html")]
+
+
+@pytest.mark.asyncio
+async def test_monitor_feeds_wait_for_confirmed_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """账号不明时不把可能属于自己的动态交给好友互动流程。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    async def unknown_login(**kwargs: Any) -> dict[str, Any]:
+        return {"status": "unknown"}
+
+    monkeypatch.setattr(service_module, "get_current_login_info", unknown_login)
+
+    assert await service.get_monitor_feeds() == []
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_uin", [None, 3693525299])
+async def test_comment_blocks_own_post_with_explicit_or_default_owner(
+    monkeypatch: pytest.MonkeyPatch, target_uin: int | None,
+) -> None:
+    """手动、模型和自治调用共享的直接评论入口必须拒绝自己的说说。"""
+    _, service, backend = _build_runtime(monkeypatch)
+
+    with pytest.raises(NeoFoxzoneError, match="不能直接评论自己的说说"):
+        await service.comment_qzone(tid="own-post", content="误评论", target_uin=target_uin)
+
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_own_post_still_allows_replies_to_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """拒绝自评说说不能影响自己说说下的楼中楼回复。"""
+    _, service, backend = _build_runtime(monkeypatch)
+    client = FakeDirectClient()
+    _install_direct_client(monkeypatch, client)
+
+    response = await service.reply_qzone_comment(
+        tid="own-post", host_uin=3693525299,
+        root_comment_id="global-root-comment-id", target_uin=10003,
+        target_name="访客", content="回复访客的评论",
+    )
+
+    assert service.response_succeeded(response)
+    assert client.calls == [("reply_comment", {
+        "host_uin": 3693525299, "tid": "own-post",
+        "root_comment_id": "global-root-comment-id", "target_uin": 10003,
+        "target_name": "访客", "content": "回复访客的评论",
+    })]
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
 async def test_service_rejects_invalid_inputs_before_backend_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -575,6 +667,7 @@ async def test_service_rejects_invalid_inputs_before_backend_call(
         await service.comment_qzone(
             tid="tid-image-comment",
             content="",
+            target_uin=20001,
             images=["https://example.test/a.jpg"],
         )
     with pytest.raises(NeoFoxzoneError, match="target_uins"):

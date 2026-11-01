@@ -67,6 +67,8 @@ DELETE <tid> <expected_author_qq> <current_login_qq>
 
 Before deletion or visibility changes, the detail endpoint must confirm both the requested `tid` and an explicit author QQ equal to the current account. Before like/comment actions, the detail endpoint must confirm the target post author. Reply requires a matching top-level comment ID and a verified author in that thread.
 
+`comment_qzone` rejects top-level comments on the current account's own posts, including calls that omit `target_uin`. Use `reply_qzone_comment` to respond to comments or replies under an own post. `get_monitor_feeds` excludes own posts before detail enrichment and returns no candidates until the current account can be confirmed.
+
 Visibility values are `1` (everyone), `4` (friends), `16` (selected friends), `64` (only me), and `128` (everyone except selected friends). Values `16` and `128` require `target_uins`.
 
 ## Capability status

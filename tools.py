@@ -287,19 +287,22 @@ class NeoFoxzoneUnlikeTool(BaseTool):
 
 
 class NeoFoxzoneCommentTool(BaseTool):
-    """评论文字或图片说说。"""
+    """评论他人的文字或图片说说。"""
 
     tool_name = "neo_foxzone_comment"
     tool_description = "评论 QQ 空间说说，可附带图片"
     name = "neo_foxzone_comment"
-    description = "根据 tid 评论说说，可提供发布者 QQ 号和图片引用列表"
+    description = (
+        "根据 tid 评论他人的说说，需提供发布者 QQ 号，可附图片引用列表；"
+        "回复自己说说下的评论请使用 neo_foxzone_reply_comment。"
+    )
     dependencies = [SERVICE_SIGNATURE]
 
     async def execute(
         self,
         tid: Annotated[str, "说说 ID"],
         content: Annotated[str, "评论正文"],
-        target_uin: Annotated[int, "说说发布者 QQ 号；未知时填 0"] = 0,
+        target_uin: Annotated[int, "说说发布者 QQ 号；不能填自己的 QQ"] = 0,
         images: Annotated[
             list[str] | None,
             "评论图片引用列表，支持 file://、http(s)://、base64://",
