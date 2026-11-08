@@ -40,7 +40,7 @@ class NeoFoxzonePlugin(BasePlugin):
 
     plugin_name = "neo-foxzone"
     plugin_description = "自动发现兼容 QZone Service 或 OneBot Adapter 的 QQ 空间插件"
-    plugin_version = "0.1.8"
+    plugin_version = "0.1.10"
     configs = [NeoFoxzoneConfig]
     # 协议端在运行时发现，缺少 OneBot Expand 不阻止插件注册。
     dependencies: list[str] = []
@@ -102,10 +102,20 @@ class NeoFoxzonePlugin(BasePlugin):
             """执行一轮检查并返回是否需要等待账号适配器就绪。"""
             try:
                 report = await poller.poll_once()
+                skipped = sum(
+                    getattr(report, field, 0)
+                    for field in (
+                        "skipped_processed",
+                        "skipped_by_model",
+                        "skipped_in_flight",
+                        "skipped_backoff",
+                    )
+                )
                 logger.info(
                     f"Neo FoxZone {label}完成: "
                     f"候选={report.candidates}, 回复={report.replied}, "
-                    f"失败={report.failed}, 查询错误={len(report.query_errors)}"
+                    f"跳过={skipped}, 失败={report.failed}, "
+                    f"查询错误={len(report.query_errors)}"
                 )
                 for error in report.query_errors:
                     logger.warning(f"Neo FoxZone {label}查询错误: {error}")
@@ -120,10 +130,6 @@ class NeoFoxzonePlugin(BasePlugin):
                 return False
 
         if config.startup_check:
-            logger.info(
-                "Neo FoxZone 启动检查开始: "
-                "正在读取自身说说与好友动态并检查可回复评论。"
-            )
             if await run_check("启动检查"):
                 retry_delay = IDENTITY_RETRY_INITIAL_SECONDS
         else:
@@ -152,11 +158,6 @@ class NeoFoxzonePlugin(BasePlugin):
                     f"预计时间={next_run:%Y-%m-%d %H:%M:%S %z}。"
                 )
             await asyncio.sleep(interval_seconds)
-            logger.info(
-                "Neo FoxZone "
-                f"{'适配器就绪重试' if is_identity_retry else '定时检查'}开始: "
-                "正在读取自身说说与好友动态并检查可回复评论。"
-            )
             still_waiting = await run_check(
                 "适配器就绪重试" if is_identity_retry else "定时检查"
             )
@@ -212,14 +213,9 @@ class NeoFoxzonePlugin(BasePlugin):
             self._poll_task = task.task
             logger.info(
                 "Neo FoxZone 自动回复轮询已启动: "
-                f"启动检查={config.polling.startup_check}, "
                 f"间隔={config.polling.interval_minutes:g} 分钟, "
-                f"自身说说={config.polling.own_posts_count} 条, "
-                f"好友动态={config.polling.friend_feeds_count} 条/页, "
-                f"历史页数={config.polling.friend_feed_pages}, "
-                f"好友说说评论={'启用' if config.polling.friend_post_replies_enabled else '禁用'}, "
                 f"单轮最多回复={config.polling.max_replies_per_poll} 条, "
-                f"任务ID={task.task_id}。"
+                f"启动检查={'启用' if config.polling.startup_check else '禁用'}。"
             )
         else:
             logger.info("Neo FoxZone 自动回复轮询已按配置禁用。")

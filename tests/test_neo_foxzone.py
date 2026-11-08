@@ -765,7 +765,7 @@ def test_plugin_registers_service_command_and_tools() -> None:
         component.dependencies == [SERVICE_SIGNATURE]
         for component in plugin.get_components()[1:]
     )
-    assert plugin.plugin_version == "0.1.8"
+    assert plugin.plugin_version == "0.1.10"
     assert plugin.dependencies == []
     assert plugin.config.plugin.version == "0.1.7"
 
@@ -795,7 +795,7 @@ def test_manifest_keeps_protocol_plugins_optional() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["name"] == "neo-foxzone"
-    assert manifest["version"] == "0.1.8"
+    assert manifest["version"] == "0.1.10"
     assert manifest["dependencies"]["plugins"] == []
     assert manifest["dependencies"]["components"] == []
     assert manifest["dependencies_required"] is False
@@ -1904,11 +1904,7 @@ async def test_poller_replies_only_to_new_candidates_and_commits_success(
         and "决策=调用 LLM 判断是否回复" in message
         for message in messages
     )
-    assert any(
-        "自动回复生成完成" in message
-        and "回复 新评论" in message
-        for message in messages
-    )
+    assert not any("回复预览=" in message for message in messages)
     assert any(
         "自动回复发送成功" in message
         and "Bot评论ID=bot-comment-new" in message
@@ -1986,9 +1982,8 @@ async def test_poller_logs_query_shape_and_safe_skip_decision(
     assert report.candidates == 0
     assert any(
         "自身说说读取完成" in message
-        and "返回说说=1" in message
-        and "声明评论=2" in message
-        and "结构化评论=0" in message
+        and "说说=1" in message
+        and "可回复候选=0" in message
         for message in messages
     )
     assert any(
@@ -1998,8 +1993,8 @@ async def test_poller_logs_query_shape_and_safe_skip_decision(
     )
     assert any(
         "好友动态读取完成" in message
-        and "返回动态=1" in message
-        and "HTML动态=1" in message
+        and "动态=1" in message
+        and "可回复候选=0" in message
         for message in messages
     )
     assert any(
@@ -2007,7 +2002,7 @@ async def test_poller_logs_query_shape_and_safe_skip_decision(
         and "详情未能补全" in message
         for message in messages
     )
-    assert any("本轮没有可安全回复的评论候选" in message for message in messages)
+    assert not any("本轮没有可安全回复的评论候选" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -2527,12 +2522,12 @@ async def test_poll_loop_survives_startup_check_exception(
         await plugin._run_poll_loop()
 
     assert poller.calls == 2
-    assert any("启动检查开始" in message for message in messages)
+    assert any("启动检查异常" in message for message in messages)
     assert any(
         "下次定时检查将在 30 分钟后执行" in message
         for message in messages
     )
-    assert any("定时检查开始" in message for message in messages)
+    assert any("定时检查完成" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -2582,7 +2577,7 @@ async def test_poll_loop_retries_identity_readiness_before_regular_interval(
     assert poller.calls == 2
     assert sleeps == [30.0, 1800.0]
     assert any("30 秒后重试适配器连接" in message for message in messages)
-    assert any("适配器就绪重试开始" in message for message in messages)
+    assert any("适配器就绪重试完成" in message for message in messages)
 
 
 @pytest.mark.asyncio

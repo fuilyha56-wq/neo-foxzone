@@ -106,22 +106,6 @@ def _structured_comment_count(posts: list[dict[str, Any]]) -> int:
     return total
 
 
-def _preview(value: Any, maximum: int = 48) -> str:
-    """生成不会换行的短文本预览。"""
-    text = " ".join(str(value or "").split())
-    if len(text) <= maximum:
-        return text
-    return f"{text[: maximum - 1]}…"
-
-
-def _mask_uin(uin: int | None) -> str:
-    """掩码日志中的 QQ 号。"""
-    text = str(uin or 0)
-    if len(text) <= 4:
-        return "*" * len(text)
-    return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
-
-
 def _candidate_label(candidate: ReplyCandidate) -> str:
     """生成用于关联候选决策日志的安全标识。"""
     source = {
@@ -129,12 +113,9 @@ def _candidate_label(candidate: ReplyCandidate) -> str:
         "friend_feed": "好友动态评论",
         "friend_post": "好友说说",
     }[candidate.source]
-    name = _preview(candidate.commenter_name, maximum=20) or "未提供昵称"
-    replied_tag = "，标签=Bot已回复" if candidate.bot_already_replied else ""
     return (
         f"来源={source}, 说说ID={candidate.post_id}, "
-        f"评论ID={candidate.comment_id}, 评论者={name}({_mask_uin(candidate.commenter_uin)})"
-        f"{replied_tag}"
+        f"评论ID={candidate.comment_id}"
     )
 
 
@@ -376,10 +357,6 @@ class QzoneReplyPoller:
             return [], 0
         # 限流退避未到期时不再发起详情风暴，让风控窗口先恢复。
         if self.state.rate_limit_cooldown_active():
-            logger.info(
-                f"{ '自身说说' if source == 'own_post' else '好友动态' }"
-                "决策=限流冷却中，本轮跳过详情补全，仅使用摘要数据。"
-            )
             return [], 0
 
         candidates: list[ReplyCandidate] = []
@@ -596,39 +573,13 @@ class QzoneReplyPoller:
                 candidates.extend(own_candidates)
                 logger.info(
                     "自身说说读取完成: "
-                    f"返回说说={len(own_posts)}, "
-                    f"声明评论={declared_comments}, "
-                    f"结构化评论={structured_comments}, "
+                    f"说说={len(own_posts)}, "
                     f"可回复候选={len(own_candidates)}。"
                 )
-                for post in own_posts:
-                    post_comments = _declared_comment_count([post])
-                    post_structured = _structured_comment_count([post])
-                    if post_comments <= 0 and post_structured <= 0:
-                        continue
-                    post_id = post.get("tid") or post.get("key") or post.get("id")
-                    logger.info(
-                        "自身说说扫描: "
-                        f"说说ID={post_id or '未知'}, "
-                        f"声明评论={post_comments}, "
-                        f"结构化评论={post_structured}, "
-                        f"正文预览={_preview(post.get('content') or post.get('text'))!r}。"
-                    )
-                if detail_attempts:
-                    logger.info(
-                        "自身说说详情补全完成: "
-                        f"详情请求={detail_attempts}, "
-                        f"新增可回复候选={len(detail_candidates)}。"
-                    )
-                elif declared_comments > 0 and structured_comments == 0:
+                if declared_comments > 0 and structured_comments == 0:
                     logger.warning(
                         "自身说说决策: 协议仅返回评论数量，未返回评论 ID、"
                         "作者、正文和父子关系；决策=不回复，避免误回复。"
-                    )
-                elif not own_candidates:
-                    logger.info(
-                        "自身说说决策: 未发现同时满足“非 Bot 评论且尚无 Bot 回复”"
-                        "的结构化评论；决策=不回复。"
                     )
             else:
                 error = NeoFoxzoneService.response_error(own_response)
@@ -676,10 +627,6 @@ class QzoneReplyPoller:
                         feeds_by_key.setdefault(
                             PollingState.post_key(post_id, owner_uin), feed
                         )
-                logger.info(
-                    f"好友动态分页读取: 页码={page_num}/{page_limit}, "
-                    f"本页动态={len(page_feeds)}, 去重后累计={len(feeds_by_key)}。"
-                )
                 if not page_feeds:
                     break
 
@@ -727,24 +674,13 @@ class QzoneReplyPoller:
             candidates.extend(feed_candidates)
             logger.info(
                 "好友动态读取完成: "
-                f"页数={successful_pages}/{page_limit}, 返回动态={len(feeds)}, "
-                f"HTML动态={html_feeds}, 结构化评论={structured_comments}, "
+                f"页数={successful_pages}/{page_limit}, 动态={len(feeds)}, "
                 f"可回复候选={len(feed_candidates)}。"
             )
-            if detail_attempts:
-                logger.info(
-                    "好友动态详情补全完成: "
-                    f"详情请求={detail_attempts}, "
-                    f"新增可回复候选={len(detail_candidates)}。"
-                )
-            elif html_feeds > 0 and structured_comments == 0:
+            if html_feeds > 0 and structured_comments == 0:
                 logger.warning(
                     "好友动态决策: 协议返回预渲染 HTML，详情未能补全；"
                     "决策=跳过需要评论关系验证的回复。"
-                )
-            elif not feed_candidates:
-                logger.info(
-                    "好友动态决策: 本轮没有未处理的好友动态或可跟进评论候选。"
                 )
         except Exception as error:
             report.query_errors.append(f"好友动态查询异常: {error}")
@@ -864,10 +800,6 @@ class QzoneReplyPoller:
         async with self._poll_lock:
             report = PollReport()
             self._sent_this_poll = 0
-            logger.info(
-                "Neo FoxZone 评论检查开始: "
-                "正在确认 Bot QQ，并读取自身说说与好友动态。"
-            )
             try:
                 bot_uin = await self._bot_uin_loader()
             except Exception as error:
@@ -881,8 +813,6 @@ class QzoneReplyPoller:
                 )
                 self.last_report = report
                 return report
-
-            logger.info(f"自动回复身份确认完成: Bot QQ={_mask_uin(bot_uin)}。")
 
             if self.state.rate_limit_cooldown_active():
                 cooldown_until = time.strftime(
@@ -908,31 +838,13 @@ class QzoneReplyPoller:
                         "本轮没有可处理候选，但存在查询错误；"
                         "决策=不调用 LLM、不发表评论，不能据此断定没有新评论。"
                     )
-                else:
-                    logger.info(
-                        "本轮没有可安全回复的评论候选；"
-                        "决策=不调用 LLM、不发表评论。"
-                    )
             for candidate in candidates:
                 if self.state.rate_limit_cooldown_active():
                     report.skipped_backoff += 1
                     continue
                 label = _candidate_label(candidate)
-                preview_content = (
-                    candidate.post_content
-                    if candidate.source == "friend_post"
-                    else candidate.comment_content
-                )
-                logger.info(
-                    f"发现自动回复候选: {label}, "
-                    f"内容预览={_preview(preview_content)!r}。"
-                )
                 if self.state.is_processed(candidate.identity):
                     report.skipped_processed += 1
-                    logger.info(
-                        f"候选决策: {label}；决策=跳过，"
-                        "原因=已回复或模型此前已决定不回复。"
-                    )
                     continue
                 if self.state.is_in_flight(candidate.identity):
                     report.skipped_in_flight += 1
@@ -944,39 +856,18 @@ class QzoneReplyPoller:
                 retry_after = self.state.retry_after(candidate.identity)
                 if retry_after > time.time():
                     report.skipped_backoff += 1
-                    retry_time = time.strftime(
-                        "%Y-%m-%d %H:%M:%S",
-                        time.localtime(retry_after),
-                    )
-                    logger.info(
-                        f"候选决策: {label}；决策=跳过，"
-                        f"原因=失败退避中，允许重试时间={retry_time}。"
-                    )
                     continue
                 if report.replied >= maximum_replies or attempts >= maximum_attempts:
-                    logger.info(
-                        "本轮处理上限已达到: "
-                        f"已回复={report.replied}/{maximum_replies}, "
-                        f"已尝试={attempts}/{maximum_attempts}；"
-                        "决策=停止处理剩余候选，留待下一轮。"
-                    )
                     break
                 attempts += 1
                 self.state.last_attempted_identity = candidate.identity
                 logger.info(
-                    f"候选决策: {label}；决策=调用 LLM 判断是否回复，"
-                    "原因=候选尚未处理且不在退避中。"
+                    f"候选处理: {label}；决策=调用 LLM 判断是否回复。"
                 )
                 try:
                     reply = (await self._reply_generator(candidate)).strip()
                     if not reply:
                         raise RuntimeError("LLM 返回了空回复。")
-                    if _is_no_reply_decision(reply):
-                        logger.info(f"LLM 决策完成: {label}；决策=不回复。")
-                    else:
-                        logger.info(
-                            f"自动回复生成完成: {label}, 回复预览={_preview(reply)!r}。"
-                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -1042,11 +933,7 @@ class QzoneReplyPoller:
                             float(config.send_jitter_seconds_max),
                         )
                         delay = random.uniform(jitter_min, jitter_max)
-                        logger.info(
-                            f"发送间隔抖动: 等待 {delay:.1f}s 后发送下一条回复。"
-                        )
                         await asyncio.sleep(delay)
-                    logger.info(f"自动回复发送开始: {label}。")
                     if candidate.source == "friend_post":
                         if candidate.target_uin is None:
                             raise RuntimeError("好友说说缺少发布者 QQ，已拒绝发表评论。")
@@ -1112,16 +999,6 @@ class QzoneReplyPoller:
                         exc_info=state_error,
                     )
                     break
-            logger.info(
-                "Neo FoxZone 评论检查决策汇总: "
-                f"候选={report.candidates}, 已处理跳过={report.skipped_processed}, "
-                f"LLM判定不回复={report.skipped_by_model}, "
-                f"占用跳过={report.skipped_in_flight}, "
-                f"退避跳过={report.skipped_backoff}, "
-                f"回复={report.replied}, 失败={report.failed}, "
-                f"查询错误={len(report.query_errors)}, "
-                f"状态错误={len(report.state_errors)}。"
-            )
             self.last_report = report
             return report
 

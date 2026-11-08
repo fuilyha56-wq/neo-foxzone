@@ -148,14 +148,11 @@ class NeoFoxzoneService(BaseService):
         comment_author_qq: int | None = None,
         root_comment_id: str | None = None,
     ) -> None:
-        """记录脱敏后的写操作校验上下文。"""
+        """记录脱敏后的最小写操作校验上下文。"""
         logger.info(
-            "真实写操作预检通过: "
-            f"operation={operation}, current={self._mask_qq(current_qq)}, "
-            f"post_author={self._mask_qq(target_author_qq)}, "
-            f"tid={self._mask_identifier(tid)}, "
-            f"comment_author={self._mask_qq(comment_author_qq)}, "
-            f"root_comment_id={self._mask_identifier(root_comment_id)}"
+            "真实写操作已校验: "
+            f"operation={operation}, 当前账号={self._mask_qq(current_qq)}, "
+            f"说说={self._mask_identifier(tid)}"
         )
 
     async def _require_write_identity(self, operation: str) -> int:
